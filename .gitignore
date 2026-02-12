@@ -1,0 +1,24 @@
+# Data files
+*.hd5f
+*.hdf5
+*.h5
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/executed_demo.ipynb
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

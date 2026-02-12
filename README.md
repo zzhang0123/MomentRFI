@@ -1,0 +1,151 @@
+# MomentRFI
+
+Iterative two-phase sigma-clipping for flagging Radio Frequency Interference (RFI) in radio cosmology waterfall data, using 2D polynomial surface fitting powered by [MomentEmu](https://github.com/zzhang0123/MomentEmu).
+
+## Installation
+
+Activate the `rfi_flagger` conda environment:
+
+```bash
+conda activate rfi_flagger
+```
+
+Dependencies: `numpy`, `scipy`, `matplotlib`, `h5py`, `jupyter`, `MomentEmu`.
+
+## Quick Start
+
+```python
+from MomentRFI import load_waterfall, validate_waterfall, IterativeSurfaceFitter
+from MomentRFI.plotting import plot_summary
+
+waterfall, freqs, times = load_waterfall("2025-12-02_16-54-49_obs.hd5f")
+validate_waterfall(waterfall)
+
+fitter = IterativeSurfaceFitter()
+mask = fitter.fit(waterfall)
+
+plot_summary(waterfall, fitter, freqs, times)
+```
+
+See `notebooks/demo_rfi_flagging.ipynb` for a full walkthrough.
+
+## Algorithm
+
+### The Problem
+
+Radio waterfall data (time x frequency) contains a smooth astrophysical signal spanning several orders of magnitude, contaminated by narrow-band or transient RFI. The goal is to fit the smooth background and flag outlier pixels as RFI.
+
+The key challenge is **coupling between polynomial degree and sigma threshold**: a low-degree polynomial leaves large residuals that inflate sigma, hiding real RFI. A high-degree polynomial can overfit RFI features, suppressing sigma and causing runaway flagging. A two-phase approach decouples these.
+
+### Two-Phase Strategy
+
+All fitting is performed in **log10 space** with coordinates normalized to **[-1, 1]**.
+
+#### Phase 1: Sigma Calibration
+
+1. Fit an **isotropic** polynomial of conservative degree (default 5, giving 21 basis terms) to the full waterfall.
+2. Compute residuals (log10 data - log10 surface) at all pixels.
+3. Estimate noise from unflagged pixels using the chosen estimator (MAD-sigma by default; see [Noise Estimators](#noise-estimators) below).
+4. Flag pixels where |residual| > sigma_threshold * sigma.
+5. Repeat from step 1 using only unflagged pixels for the fit.
+6. Stop when <0.001% of pixels change between iterations (convergence), >50% are flagged (safety abort), or 15 iterations are reached.
+7. Record the final sigma as the **sigma floor**.
+
+The low-degree polynomial intentionally underfits fine spectral structure, producing a reliable upper bound on the true noise level.
+
+#### Phase 2: Refined Fitting
+
+1. **Reset the mask** (start from scratch with no flags).
+2. Fit an **anisotropic** polynomial with higher frequency-axis degree (default 10) and the same time-axis degree (default 5), giving 66 basis terms. This better captures spectral structure without overfitting time-domain variations.
+3. Compute residuals and sigma as before, but enforce: `sigma_used = max(sigma_raw, sigma_floor)`. This prevents the improved polynomial from driving sigma too low and causing runaway flagging.
+4. Flag and iterate with the same stopping criteria as Phase 1.
+
+The result is a mask with fewer false positives than Phase 1 alone, because the higher-degree polynomial removes spectral structure that Phase 1 would misidentify as RFI.
+
+### Noise Estimators
+
+Two options are available via the `noise_estimator` parameter:
+
+**`"mad"` (default)** — Median Absolute Deviation: `1.4826 * median(|x - median(x)|)`. Robust up to ~50% contamination. The median remains anchored to the clean population even when many pixels are RFI. This is the right choice for most datasets.
+
+**`"lower_tail"`** — Zero-mean Gaussian fit to the lower tail. RFI adds power, so it only inflates the *upper* tail of the residual distribution. The lower tail should be clean noise. We histogram the bottom `lower_tail_fraction` (default 20%) of residuals and fit `A * exp(-x² / 2σ²)` analytically via linear regression of `log(counts)` vs `x²` — no iterative optimisation, just a closed-form solution.
+
+| | MAD | Lower-tail |
+|---|---|---|
+| **Robust up to** | ~50% contamination | >50% (only lower tail needs to be clean) |
+| **Speed** | Fast (two passes over data) | Fast (O(n) partition + histogram + linear regression) |
+| **On clean data** | Tighter sigma, more sensitive | Wider sigma (includes spectral structure), more conservative |
+| **Best for** | Moderate RFI (<50%) | Heavy RFI (>50%) where MAD breaks down |
+
+(Note: I found MAD generally works better, at least for Phase 1.)
+
+### Polynomial Basis
+
+For a 2D polynomial (frequency, time):
+- **Isotropic degree d**: all monomials `freq^a * time^b` where `a + b <= d`. Number of terms = `(d+1)(d+2)/2`.
+- **Anisotropic degrees (d_freq, d_time)**: all monomials where `a <= d_freq` and `b <= d_time`. Number of terms = `(d_freq+1) * (d_time+1)`.
+
+Fitting uses the **moment method**: accumulate `M = Phi^T Phi / N` and `nu = Phi^T y / N` in batches (only building the small D x D matrix, never the full N x D design matrix), then solve `M c = nu`. This keeps memory usage constant regardless of waterfall size.
+
+## Parameters
+
+### `IterativeSurfaceFitter`
+
+| Parameter | Default | Description |
+|---|---|---|
+| `sigma_threshold` | 4.0 | Clipping threshold in units of sigma. Pixels with \|residual\| > threshold * sigma are flagged. Lower values flag more aggressively. |
+| `phase1_degree` | 5 | Isotropic polynomial degree for Phase 1 (sigma calibration). Higher values fit more spectral detail but risk absorbing RFI into the model. |
+| `phase2_degree_freq` | 10 | Frequency-axis degree for Phase 2. Frequency structure typically needs higher polynomial order than time. |
+| `phase2_degree_time` | 5 | Time-axis degree for Phase 2. Time variations are usually smoother (or up to your perception from the waterfall..). |
+| `sigma_floor_factor` | 1.0 | Multiplier on the Phase 1 sigma to set the floor. Values > 1.0 make Phase 2 more conservative (fewer flags). |
+| `convergence_fraction` | 1e-5 | Iteration stops when the fraction of pixels that changed state is below this value. |
+| `min_good_fraction` | 0.5 | Safety abort: if the fraction of unflagged pixels drops below this, iteration stops immediately. |
+| `max_iterations` | 15 | Hard cap on iterations per phase. |
+| `batch_size` | 200,000 | Number of pixels processed per batch during polynomial evaluation. Controls memory vs speed tradeoff. |
+| `noise_estimator` | `"mad"` | `"mad"` or `"lower_tail"`. See [Noise Estimators](#noise-estimators). |
+| `lower_tail_fraction` | 0.2 | Fraction of lowest residuals used by the `"lower_tail"` estimator. Smaller = more conservative but noisier. |
+| `force_flag_fallback` | False | Force-flag top outliers when sigma is overestimated and flagging stalls (see below). |
+| `verbose` | True | Print per-iteration diagnostics. |
+
+### Outputs (after calling `.fit()`)
+
+| Attribute | Type | Description |
+|---|---|---|
+| `mask` | `ndarray[bool]` (n_time, n_freq) | `True` where RFI is flagged. |
+| `surface` | `ndarray[float]` (n_time, n_freq) | Fitted polynomial surface in **linear** scale (10^fitted_log10). |
+| `residuals` | `ndarray[float]` (n_time, n_freq) | Residuals in **log10** scale (log10_data - log10_surface). |
+| `sigma_floor` | `float` | MAD-sigma from Phase 1 convergence. |
+| `history` | `dict` | Per-iteration diagnostics for both phases (sigma, flag count, convergence). |
+
+## Data Format
+
+Expects HDF5 files with the structure:
+```
+sdr/
+  sdr_waterfall   (n_time, n_freq)  float64   -- power values, must be all positive
+  sdr_freqs       (n_freq,)         float64   -- frequency axis in MHz
+  sdr_times       (n_time,)         float64   -- time axis in seconds
+```
+
+## Tuning Guide
+
+- **Too many flags?** Increase `sigma_threshold` (try 4.5 or 5.0) or increase `sigma_floor_factor`.
+- **Missing faint RFI?** Decrease `sigma_threshold` (try 3.5), but watch for runaway flagging via the convergence plot.
+- **>50% RFI?** Switch to `noise_estimator="lower_tail"`. MAD breaks down above ~50% contamination; the lower-tail fit stays valid as long as RFI only adds power.
+- **Polynomial ringing at band edges?** Decrease `phase2_degree_freq`.
+- **Slow convergence?** Usually not an issue (typically 7-12 iterations), but can lower `max_iterations` to cap runtime.
+
+## Project Structure
+
+```
+RFI_flagger/
+├── MomentRFI/
+│   ├── __init__.py      # Package exports
+│   ├── core.py          # IterativeSurfaceFitter (imports polynomial fitting from MomentEmu)
+│   ├── io.py            # load_waterfall(), validate_waterfall()
+│   ├── utils.py         # mad_sigma(), lower_tail_sigma(), coordinate grid utilities
+│   └── plotting.py      # Visualization functions
+├── notebooks/
+│   └── demo_rfi_flagging.ipynb
+└── 2025-12-02_16-54-49_obs.hd5f
+```
