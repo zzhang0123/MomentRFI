@@ -155,6 +155,64 @@ def plot_convergence(history, ax=None):
     return axes
 
 
+def plot_time_averaged_spectrum(waterfall, freqs=None, mask=None, ax=None,
+                                 title="Time-Averaged Spectrum", log=True):
+    """Plot time-averaged spectrum, optionally comparing original vs cleaned.
+
+    Parameters
+    ----------
+    waterfall : ndarray, shape (n_time, n_freq)
+        Original waterfall data.
+    freqs : ndarray, optional
+        Frequency axis in MHz.
+    mask : ndarray of bool, optional, shape (n_time, n_freq)
+        RFI mask. If provided, plots both original and cleaned spectra.
+    ax : matplotlib Axes, optional
+    title : str
+    log : bool
+        Use log scale for y-axis.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(1, 1, figsize=(12, 5))
+
+    # Compute time-averaged spectrum
+    spectrum_original = np.mean(waterfall, axis=0)
+
+    if freqs is None:
+        freqs = np.arange(len(spectrum_original))
+        xlabel = "Channel"
+    else:
+        xlabel = "Frequency [MHz]"
+
+    # Plot original spectrum
+    ax.plot(freqs, spectrum_original, '-', alpha=0.7, label="Original", linewidth=1.5)
+
+    # If mask provided, compute and plot cleaned spectrum
+    if mask is not None:
+        waterfall_cleaned = waterfall.astype(float).copy()
+        waterfall_cleaned[mask] = np.nan
+        spectrum_cleaned = np.nanmean(waterfall_cleaned, axis=0)
+        ax.plot(freqs, spectrum_cleaned, '-', alpha=0.7, label="Cleaned", linewidth=1.5)
+        ax.legend()
+
+        # Add statistics
+        n_flagged = mask.sum()
+        frac = n_flagged / mask.size
+        ax.text(0.02, 0.98, f"Flagged: {frac:.2%}", transform=ax.transAxes,
+                verticalalignment='top', fontsize=10,
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Power")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
+    if log:
+        ax.set_yscale('log')
+
+    return ax
+
+
 def plot_summary(waterfall, fitter, freqs=None, times=None):
     """Five-panel summary: original, surface, flagged, residuals, mask.
 

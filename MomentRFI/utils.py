@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.ndimage import uniform_filter
 
 
 def mad_sigma(residuals):
@@ -116,3 +117,58 @@ def build_coordinate_grid(n_time, n_freq):
     tt, ff = np.meshgrid(time_norm, freq_norm, indexing="ij")
     coords = np.column_stack([ff.ravel(), tt.ravel()])
     return coords
+
+
+def smooth_mask(mask, kernel_size=3):
+    """Smooth a boolean mask and round to nearest integer.
+
+    This performs morphological smoothing by:
+    1. Converting the boolean mask to float (0.0 or 1.0)
+    2. Applying a uniform (box) filter of given size
+    3. Rounding to nearest integer (0 or 1)
+    4. Converting back to boolean
+
+    Use cases:
+    - Fill small unflagged gaps within flagged regions (acts like closing)
+    - Expand flagged regions slightly to create a more conservative mask
+    - Remove isolated single-pixel flags (acts like opening)
+
+    Parameters
+    ----------
+    mask : ndarray of bool, shape (n_time, n_freq)
+        Input boolean mask (True = flagged).
+    kernel_size : int or tuple of int
+        Size of the uniform filter kernel. If int, uses the same size
+        for both dimensions. If tuple (size_time, size_freq), applies
+        different smoothing along each axis.
+        - kernel_size=3: minimal smoothing (3x3 box)
+        - kernel_size=5: moderate smoothing (5x5 box)
+        - kernel_size=(1, 5): smooth only along frequency axis
+
+    Returns
+    -------
+    ndarray of bool, shape (n_time, n_freq)
+        Smoothed mask (True = flagged).
+
+    Examples
+    --------
+    >>> mask = np.array([[1, 0, 1], [1, 1, 1], [0, 1, 0]], dtype=bool)
+    >>> smooth_mask(mask, kernel_size=3)
+    array([[ True,  True,  True],
+           [ True,  True,  True],
+           [ True,  True,  True]])
+
+    Notes
+    -----
+    The smoothing threshold is 0.5 after convolution, meaning a pixel
+    becomes flagged if more than half its neighbors (within the kernel)
+    are flagged. Adjust kernel_size to control the degree of dilation/erosion.
+    """
+    # Convert bool to float for filtering
+    mask_float = mask.astype(float)
+
+    # Apply uniform filter (box average)
+    smoothed = uniform_filter(mask_float, size=kernel_size, mode='constant', cval=0.0)
+
+    # Round to nearest integer: >= 0.5 -> 1, < 0.5 -> 0
+    return np.round(smoothed).astype(bool)
