@@ -14,7 +14,6 @@ build/
 
 # Jupyter
 .ipynb_checkpoints/
-notebooks/executed_demo.ipynb
 
 # IDE
 .vscode/
