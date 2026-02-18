@@ -27,7 +27,9 @@ See `notebooks/demo_rfi_flagging.ipynb` for a full walkthrough.
 
 ### The Problem
 
-Radio waterfall data (time x frequency) contains a smooth astrophysical signal spanning several orders of magnitude, contaminated by narrow-band or transient RFI. The goal is to fit the smooth background and flag outlier pixels as RFI.
+Radio waterfall data (time × frequency) contains a smooth astrophysical signal spanning several orders of magnitude, contaminated by narrow-band or transient RFI. The goal is to fit the smooth background and flag outlier data points as RFI.
+
+> **Terminology:** throughout this documentation, *pixel* is used as a convenient shorthand for a single data point in the 2D waterfall array — i.e. one (time, frequency) sample. The data are not images, but the term is standard in RFI flagging literature.
 
 The key challenge is **coupling between polynomial degree and sigma threshold**: a low-degree polynomial leaves large residuals that inflate sigma, hiding real RFI. A high-degree polynomial can overfit RFI features, suppressing sigma and causing runaway flagging. A two-phase approach decouples these.
 
