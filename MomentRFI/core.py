@@ -1,5 +1,6 @@
 import numpy as np
 from math import erfc, sqrt
+from scipy.ndimage import convolve
 
 from MomentEmu.PolyEmu import (
     generate_multi_indices,
@@ -78,10 +79,13 @@ class IterativeSurfaceFitter:
         Symmetric clipping threshold in units of sigma.
     phase1_degree : int
         Isotropic polynomial degree for Phase 1.
-    phase2_degree_freq : int
-        Frequency-axis polynomial degree for Phase 2.
-    phase2_degree_time : int
-        Time-axis polynomial degree for Phase 2.
+    phase2_degree_freq : int or None
+        Frequency-axis polynomial degree for Phase 2. Set to ``None``
+        (together with ``phase2_degree_time``) to skip Phase 2 entirely
+        and return the Phase 1 mask directly.
+    phase2_degree_time : int or None
+        Time-axis polynomial degree for Phase 2. Set to ``None``
+        (together with ``phase2_degree_freq``) to skip Phase 2.
     sigma_floor_factor : float
         Multiplier on Phase 1 sigma to set the sigma floor for Phase 2.
     convergence_fraction : float
@@ -101,11 +105,23 @@ class IterativeSurfaceFitter:
         Quantile used by the ``"lower_tail"`` estimator (e.g. 0.2 means
         the 20th-percentile).  Smaller values are more conservative but
         noisier.
+    sigma_value : float or None
+        If provided, use this value directly as sigma in every iteration of
+        both phases, bypassing the noise estimator and the Phase 2 sigma
+        floor. Default ``None`` uses the normal data-driven estimation.
     force_flag_fallback : bool
         If True, when sigma is overestimated and fewer than 1/4 of the
         Gaussian-expected outliers are flagged, force-flag the top N
         pixels by |residual| (where N is the Gaussian expectation) to
         ensure progress.
+    one_sided_clipping : bool
+        If True, during convergence iterations only pixels with
+        ``residual > +k·sigma`` (above the surface) are flagged. RFI always
+        adds power, so below-surface pixels are clean noise and should not
+        bias the surface fit. After the final converged phase, one additional
+        symmetric pass ``|residual| > threshold`` is applied to also flag
+        extreme low-noise statistical outliers. Default False (symmetric
+        clipping throughout, current behaviour).
     verbose : bool
         Print progress info.
     """
@@ -123,7 +139,9 @@ class IterativeSurfaceFitter:
         batch_size=200_000,
         noise_estimator="mad",
         lower_tail_fraction=0.2,
+        sigma_value=None,
         force_flag_fallback=False,
+        one_sided_clipping=False,
         verbose=True,
     ):
         if noise_estimator not in ("mad", "lower_tail"):
@@ -139,7 +157,9 @@ class IterativeSurfaceFitter:
         self.batch_size = batch_size
         self.noise_estimator = noise_estimator
         self.lower_tail_fraction = lower_tail_fraction
+        self.sigma_value = sigma_value
         self.force_flag_fallback = force_flag_fallback
+        self.one_sided_clipping = one_sided_clipping
         self.verbose = verbose
 
         # Results (populated after fit)
@@ -155,37 +175,59 @@ class IterativeSurfaceFitter:
             return lower_tail_sigma(residuals, self.lower_tail_fraction)
         return mad_sigma(residuals)
 
-    def fit(self, waterfall):
+    def fit(self, waterfall, prior_mask=None):
         """Run the two-phase RFI flagging algorithm.
 
         Parameters
         ----------
         waterfall : ndarray, shape (n_time, n_freq)
             Raw waterfall data (positive values, linear scale).
+        prior_mask : ndarray of bool, shape (n_time, n_freq), optional
+            A priori mask of known-bad pixels. True = flagged. These pixels
+            are excluded from surface fitting in both phases and remain
+            flagged in the returned mask.
 
         Returns
         -------
         mask : ndarray of bool, shape (n_time, n_freq)
-            True where RFI is flagged.
+            True where RFI is flagged. If ``phase2_degree_freq`` or
+            ``phase2_degree_time`` is ``None``, Phase 2 is skipped and
+            the Phase 1 mask is returned directly.
         """
         n_time, n_freq = waterfall.shape
         n_pixels = n_time * n_freq
         log_data = np.log10(waterfall).ravel()
         coords = build_coordinate_grid(n_time, n_freq)
 
+        # Validate and flatten prior mask
+        if prior_mask is not None:
+            prior_mask = np.asarray(prior_mask, dtype=bool)
+            if prior_mask.shape != (n_time, n_freq):
+                raise ValueError(
+                    f"prior_mask shape {prior_mask.shape} does not match waterfall shape {(n_time, n_freq)}"
+                )
+            prior_mask_flat = prior_mask.ravel()
+        else:
+            prior_mask_flat = np.zeros(n_pixels, dtype=bool)
+
         # ---- Phase 1: Sigma Calibration ----
         if self.verbose:
             print("=" * 60)
             print("Phase 1: Sigma Calibration (isotropic degree {})".format(self.phase1_degree))
-            print(f"  Noise estimator: {self.noise_estimator}"
-                  + (f" (tail={self.lower_tail_fraction})" if self.noise_estimator == "lower_tail" else ""))
+            if self.sigma_value is not None:
+                print(f"  Sigma: fixed={self.sigma_value} (noise estimator bypassed)")
+            else:
+                print(f"  Noise estimator: {self.noise_estimator}"
+                      + (f" (tail={self.lower_tail_fraction})" if self.noise_estimator == "lower_tail" else ""))
+            if self.one_sided_clipping:
+                print("  Clipping: one-sided (positive residuals only during convergence)")
             print("=" * 60)
 
         multi_indices_p1 = generate_multi_indices(2, self.phase1_degree)
         if self.verbose:
             print(f"  Number of basis terms: {len(multi_indices_p1)}")
 
-        mask_flat = np.zeros(n_pixels, dtype=bool)
+        mask_flat = prior_mask_flat.copy()
         sigma_floor = None
 
         for iteration in range(1, self.max_iterations + 1):
@@ -205,10 +247,14 @@ class IterativeSurfaceFitter:
             residuals_flat = log_data - surface_flat
 
             # Compute sigma from unflagged pixels only
-            sigma = self._estimate_sigma(residuals_flat[good])
+            sigma = (self.sigma_value if self.sigma_value is not None
+                     else self._estimate_sigma(residuals_flat[good]))
 
-            # Flag: symmetric clipping
-            new_mask = np.abs(residuals_flat) > self.sigma_threshold * sigma
+            # Flag: one-sided or symmetric clipping
+            if self.one_sided_clipping:
+                new_mask = residuals_flat > self.sigma_threshold * sigma
+            else:
+                new_mask = np.abs(residuals_flat) > self.sigma_threshold * sigma
 
             # Fallback: if sigma is overestimated, too few pixels get flagged
             # and iteration stalls.  For a Gaussian, we expect a known fraction
@@ -216,13 +262,23 @@ class IterativeSurfaceFitter:
             # top N by |residual| to ensure progress.
             forced = False
             if self.force_flag_fallback:
-                expected_n = int(n_good * _gaussian_expected_flag_fraction(self.sigma_threshold))
-                actual_n = int(new_mask.sum())
-                if expected_n > 0 and actual_n < expected_n // 4:
-                    abs_res = np.abs(residuals_flat)
-                    threshold_val = np.partition(abs_res, -expected_n)[-expected_n]
-                    new_mask = abs_res >= threshold_val
-                    forced = True
+                if self.one_sided_clipping:
+                    expected_n = int(n_good * _gaussian_expected_flag_fraction(self.sigma_threshold) / 2)
+                    actual_n = int(new_mask.sum())
+                    if expected_n > 0 and actual_n < expected_n // 4:
+                        threshold_val = np.partition(residuals_flat, -expected_n)[-expected_n]
+                        new_mask = residuals_flat >= threshold_val
+                        forced = True
+                else:
+                    expected_n = int(n_good * _gaussian_expected_flag_fraction(self.sigma_threshold))
+                    actual_n = int(new_mask.sum())
+                    if expected_n > 0 and actual_n < expected_n // 4:
+                        abs_res = np.abs(residuals_flat)
+                        threshold_val = np.partition(abs_res, -expected_n)[-expected_n]
+                        new_mask = abs_res >= threshold_val
+                        forced = True
+
+            new_mask |= prior_mask_flat
 
             changed = np.sum(new_mask != mask_flat)
             changed_frac = changed / n_pixels
@@ -256,11 +312,39 @@ class IterativeSurfaceFitter:
         if self.verbose:
             print(f"  Phase 1 sigma floor: {sigma_floor:.6f}")
 
+        # ---- Optional early exit: Phase 2 skipped ----
+        if self.phase2_degree_freq is None or self.phase2_degree_time is None:
+            if self.verbose:
+                print("\n  Phase 2 skipped (phase2_degree_freq or phase2_degree_time is None).")
+            if self.one_sided_clipping:
+                # Surface is now finalised; apply one symmetric pass to also catch
+                # extreme low-noise outliers on both sides.
+                final_mask = np.abs(residuals_flat) > self.sigma_threshold * sigma
+                final_mask |= prior_mask_flat
+                mask_flat = final_mask
+                if self.verbose:
+                    print("  [one_sided] Final symmetric pass applied.")
+            self.mask = mask_flat.reshape(n_time, n_freq)
+            self.surface = (10.0 ** surface_flat).reshape(n_time, n_freq)
+            self.residuals = residuals_flat.reshape(n_time, n_freq)
+            if self.verbose:
+                total_flagged = self.mask.sum()
+                actual_frac = total_flagged / n_pixels
+                gauss_frac = _gaussian_expected_flag_fraction(self.sigma_threshold)
+                ratio = actual_frac / gauss_frac if gauss_frac > 0 else float("inf")
+                print()
+                print(f"Final: {total_flagged} pixels flagged ({actual_frac:.4%})")
+                print(f"  Gaussian expectation at {self.sigma_threshold:.1f}-sigma: {gauss_frac:.4%}")
+                print(f"  Actual / expected: {ratio:.1f}x")
+            return self.mask
+
         # ---- Phase 2: Refined Fitting ----
         if self.verbose:
             print()
             print("=" * 60)
             print(f"Phase 2: Refined Fitting (degree freq={self.phase2_degree_freq}, time={self.phase2_degree_time})")
+            if self.one_sided_clipping:
+                print("  Clipping: one-sided (positive residuals only during convergence)")
             print("=" * 60)
 
         multi_indices_p2 = generate_multi_indices_with_degree_vec(
@@ -270,7 +354,7 @@ class IterativeSurfaceFitter:
             print(f"  Number of basis terms: {len(multi_indices_p2)}")
 
         # Reset mask
-        mask_flat = np.zeros(n_pixels, dtype=bool)
+        mask_flat = prior_mask_flat.copy()
 
         for iteration in range(1, self.max_iterations + 1):
             good = ~mask_flat
@@ -289,22 +373,37 @@ class IterativeSurfaceFitter:
             residuals_flat = log_data - surface_flat
 
             # Compute sigma with floor enforcement
-            sigma_raw = self._estimate_sigma(residuals_flat[good])
-            sigma = max(sigma_raw, sigma_floor)
+            sigma_raw = (self.sigma_value if self.sigma_value is not None
+                         else self._estimate_sigma(residuals_flat[good]))
+            sigma = (self.sigma_value if self.sigma_value is not None
+                     else max(sigma_raw, sigma_floor))
 
-            # Flag: symmetric clipping
-            new_mask = np.abs(residuals_flat) > self.sigma_threshold * sigma
+            # Flag: one-sided or symmetric clipping
+            if self.one_sided_clipping:
+                new_mask = residuals_flat > self.sigma_threshold * sigma
+            else:
+                new_mask = np.abs(residuals_flat) > self.sigma_threshold * sigma
 
             # Fallback: force-flag if sigma is overestimated (see Phase 1)
             forced = False
             if self.force_flag_fallback:
-                expected_n = int(n_good * _gaussian_expected_flag_fraction(self.sigma_threshold))
-                actual_n = int(new_mask.sum())
-                if expected_n > 0 and actual_n < expected_n // 4:
-                    abs_res = np.abs(residuals_flat)
-                    threshold_val = np.partition(abs_res, -expected_n)[-expected_n]
-                    new_mask = abs_res >= threshold_val
-                    forced = True
+                if self.one_sided_clipping:
+                    expected_n = int(n_good * _gaussian_expected_flag_fraction(self.sigma_threshold) / 2)
+                    actual_n = int(new_mask.sum())
+                    if expected_n > 0 and actual_n < expected_n // 4:
+                        threshold_val = np.partition(residuals_flat, -expected_n)[-expected_n]
+                        new_mask = residuals_flat >= threshold_val
+                        forced = True
+                else:
+                    expected_n = int(n_good * _gaussian_expected_flag_fraction(self.sigma_threshold))
+                    actual_n = int(new_mask.sum())
+                    if expected_n > 0 and actual_n < expected_n // 4:
+                        abs_res = np.abs(residuals_flat)
+                        threshold_val = np.partition(abs_res, -expected_n)[-expected_n]
+                        new_mask = abs_res >= threshold_val
+                        forced = True
+
+            new_mask |= prior_mask_flat
 
             changed = np.sum(new_mask != mask_flat)
             changed_frac = changed / n_pixels
@@ -336,6 +435,15 @@ class IterativeSurfaceFitter:
                     print(f"  Converged at iteration {iteration}.")
                 break
 
+        if self.one_sided_clipping:
+            # Surface is now finalised; apply one symmetric pass to also catch
+            # extreme low-noise outliers on both sides.
+            final_mask = np.abs(residuals_flat) > self.sigma_threshold * sigma
+            final_mask |= prior_mask_flat
+            mask_flat = final_mask
+            if self.verbose:
+                print("  [one_sided] Final symmetric pass applied.")
+
         # Store results
         self.mask = mask_flat.reshape(n_time, n_freq)
         self.surface = (10.0 ** surface_flat).reshape(n_time, n_freq)
@@ -347,8 +455,77 @@ class IterativeSurfaceFitter:
             gauss_frac = _gaussian_expected_flag_fraction(self.sigma_threshold)
             ratio = actual_frac / gauss_frac if gauss_frac > 0 else float("inf")
             print()
-            print(f"Final: {total_flagged} pixels flagged ({actual_frac:.4%})")
+            print(f"Final: {total_flagged} data points flagged ({actual_frac:.4%})")
             print(f"  Gaussian expectation at {self.sigma_threshold:.1f}-sigma: {gauss_frac:.4%}")
             print(f"  Actual / expected: {ratio:.1f}x")
 
+        return self.mask
+
+    def smooth_mask_with_kernel(self, kernel_size=3, axis=1):
+        """Dilate self.mask with a 1D kernel along a single axis.
+
+        Any pixel whose 1D convolution result is > 0 — i.e. at least one
+        flagged pixel falls within the kernel's reach along the chosen axis —
+        is flagged. This is a 1D morphological dilation: flagged regions expand
+        by ``(kernel_size - 1) // 2`` pixels in both directions along the axis.
+
+        Parameters
+        ----------
+        kernel_size : int
+            Length of the uniform (all-ones) 1D kernel. A larger value
+            produces a wider dilation.
+        axis : int
+            0 to dilate along the time axis (each flagged pixel spreads to
+            neighbouring time samples at the same frequency),
+            1 to dilate along the frequency axis (each flagged pixel spreads
+            to neighbouring channels at the same time).
+
+        Returns
+        -------
+        ndarray of bool, shape (n_time, n_freq)
+            Dilated mask (True = flagged). Also updates self.mask in place.
+        """
+        if self.mask is None:
+            raise RuntimeError("No mask available. Run fit() first.")
+        if axis not in (0, 1):
+            raise ValueError(f"axis must be 0 (time) or 1 (frequency), got {axis!r}")
+        # Build a 2D kernel that is 1D along the chosen axis
+        if axis == 1:
+            kernel = np.ones((1, kernel_size), dtype=float)
+        else:
+            kernel = np.ones((kernel_size, 1), dtype=float)
+        smoothed = convolve(self.mask.astype(float), kernel, mode='constant', cval=0.0)
+        self.mask = smoothed > 0
+        return self.mask
+
+    def flag_by_fraction(self, threshold, axis):
+        """Flag entire rows or columns where flagged fraction exceeds a threshold.
+
+        Parameters
+        ----------
+        threshold : float
+            Fraction of flagged pixels in a row/column at or above which the
+            entire row/column is flagged. E.g. 0.5 flags any row/column that
+            is already more than half flagged.
+        axis : int
+            0 to flag time rows (each time sample checked independently),
+            1 to flag frequency columns (each frequency channel checked).
+
+        Returns
+        -------
+        ndarray of bool, shape (n_time, n_freq)
+            Updated mask (True = flagged). Also updates self.mask in place.
+        """
+        if self.mask is None:
+            raise RuntimeError("No mask available. Run fit() first.")
+        if axis not in (0, 1):
+            raise ValueError(f"axis must be 0 (time rows) or 1 (freq columns), got {axis!r}")
+        mask = self.mask.copy()
+        fractions = mask.mean(axis=1 - axis)  # axis=0 -> mean over cols; axis=1 -> mean over rows
+        over = fractions >= threshold
+        if axis == 0:
+            mask[over, :] = True
+        else:
+            mask[:, over] = True
+        self.mask = mask
         return self.mask

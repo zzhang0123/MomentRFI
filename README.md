@@ -4,12 +4,6 @@ Iterative two-phase sigma-clipping for flagging Radio Frequency Interference (RF
 
 ## Installation
 
-Activate the `rfi_flagger` conda environment:
-
-```bash
-conda activate rfi_flagger
-```
-
 Dependencies: `numpy`, `scipy`, `matplotlib`, `h5py`, `jupyter`, `MomentEmu`.
 
 ## Quick Start
@@ -53,9 +47,11 @@ All fitting is performed in **log10 space** with coordinates normalized to **[-1
 
 The low-degree polynomial intentionally underfits fine spectral structure, producing a reliable upper bound on the true noise level.
 
-#### Phase 2: Refined Fitting
+#### Phase 2: Refined Fitting (optional)
 
-1. **Reset the mask** (start from scratch with no flags).
+Phase 2 is skipped when `phase2_degree_freq=None` or `phase2_degree_time=None`; in that case the Phase 1 mask, surface, and residuals are returned directly.
+
+1. **Reset the mask** (start from any a priori flags supplied via `prior_mask`; discard Phase 1 sigma-clip flags).
 2. Fit an **anisotropic** polynomial with higher frequency-axis degree (default 10) and the same time-axis degree (default 5), giving 66 basis terms. This better captures spectral structure without overfitting time-domain variations.
 3. Compute residuals and sigma as before, but enforce: `sigma_used = max(sigma_raw, sigma_floor)`. This prevents the improved polynomial from driving sigma too low and causing runaway flagging.
 4. Flag and iterate with the same stopping criteria as Phase 1.
@@ -95,8 +91,8 @@ Fitting uses the **moment method**: accumulate `M = Phi^T Phi / N` and `nu = Phi
 |---|---|---|
 | `sigma_threshold` | 4.0 | Clipping threshold in units of sigma. Pixels with \|residual\| > threshold * sigma are flagged. Lower values flag more aggressively. |
 | `phase1_degree` | 5 | Isotropic polynomial degree for Phase 1 (sigma calibration). Higher values fit more spectral detail but risk absorbing RFI into the model. |
-| `phase2_degree_freq` | 10 | Frequency-axis degree for Phase 2. Frequency structure typically needs higher polynomial order than time. |
-| `phase2_degree_time` | 5 | Time-axis degree for Phase 2. Time variations are usually smoother (or up to your perception from the waterfall..). |
+| `phase2_degree_freq` | 10 | Frequency-axis degree for Phase 2. Frequency structure typically needs higher polynomial order than time. Set to `None` (with `phase2_degree_time=None`) to skip Phase 2 and return the Phase 1 mask directly. |
+| `phase2_degree_time` | 5 | Time-axis degree for Phase 2. Time variations are usually smoother. Set to `None` (with `phase2_degree_freq=None`) to skip Phase 2. |
 | `sigma_floor_factor` | 1.0 | Multiplier on the Phase 1 sigma to set the floor. Values > 1.0 make Phase 2 more conservative (fewer flags). |
 | `convergence_fraction` | 1e-5 | Iteration stops when the fraction of pixels that changed state is below this value. |
 | `min_good_fraction` | 0.5 | Safety abort: if the fraction of unflagged pixels drops below this, iteration stops immediately. |
@@ -104,8 +100,17 @@ Fitting uses the **moment method**: accumulate `M = Phi^T Phi / N` and `nu = Phi
 | `batch_size` | 200,000 | Number of pixels processed per batch during polynomial evaluation. Controls memory vs speed tradeoff. |
 | `noise_estimator` | `"mad"` | `"mad"` or `"lower_tail"`. See [Noise Estimators](#noise-estimators). |
 | `lower_tail_fraction` | 0.2 | Fraction of lowest residuals used by the `"lower_tail"` estimator. Smaller = more conservative but noisier. |
+| `sigma_value` | `None` | Fixed sigma for clipping. If set, bypasses both the noise estimator and the Phase 2 sigma floor. Default `None` estimates sigma from data each iteration. |
 | `force_flag_fallback` | False | Force-flag top outliers when sigma is overestimated and flagging stalls (see below). |
+| `one_sided_clipping` | False | If True, convergence iterations only flag pixels above the surface (`residual > +k·sigma`). A final symmetric pass is applied after convergence to also flag extreme low-noise outliers. Default False (symmetric clipping throughout). |
 | `verbose` | True | Print per-iteration diagnostics. |
+
+### `fit()` Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `waterfall` | — | 2D ndarray `(n_time, n_freq)`, positive linear-scale power values. |
+| `prior_mask` | `None` | Optional bool ndarray `(n_time, n_freq)`. `True` = known-bad pixel. Prior-flagged pixels are excluded from surface fitting in both phases and are always `True` in the returned mask, regardless of their residual. |
 
 ### Outputs (after calling `.fit()`)
 
@@ -116,6 +121,48 @@ Fitting uses the **moment method**: accumulate `M = Phi^T Phi / N` and `nu = Phi
 | `residuals` | `ndarray[float]` (n_time, n_freq) | Residuals in **log10** scale (log10_data - log10_surface). |
 | `sigma_floor` | `float` | MAD-sigma from Phase 1 convergence. |
 | `history` | `dict` | Per-iteration diagnostics for both phases (sigma, flag count, convergence). |
+
+### Post-processing Methods
+
+After calling `.fit()`, two methods are available to refine the mask:
+
+#### `smooth_mask_with_kernel(kernel_size=3, axis=1)`
+
+Dilate `self.mask` with a 1D kernel along a single axis. Any pixel that lies within `(kernel_size - 1) // 2` steps of a flagged pixel along the chosen axis is also flagged. This is a 1D morphological dilation.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `kernel_size` | 3 | Length of the uniform 1D kernel. Larger values produce a wider dilation. |
+| `axis` | 1 | `0` to dilate along time (flags spread to neighbouring time samples), `1` to dilate along frequency (flags spread to neighbouring channels). |
+
+Updates `self.mask` in place and returns the new mask. Raises `RuntimeError` if called before `fit()`, `ValueError` if `axis` is not 0 or 1.
+
+```python
+# Dilate 3 channels wide along frequency
+mask = fitter.smooth_mask_with_kernel(kernel_size=3, axis=1)
+
+# Dilate 5 time samples wide along time
+mask = fitter.smooth_mask_with_kernel(kernel_size=5, axis=0)
+```
+
+#### `flag_by_fraction(threshold, axis)`
+
+Flag entire time rows or frequency columns where the fraction of already-flagged pixels meets or exceeds `threshold`. Avoids retaining thin slivers of nominally "good" data in heavily contaminated rows/columns.
+
+| Parameter | Description |
+|---|---|
+| `threshold` | Float in [0, 1]. Flag the entire row/column if its flagged fraction ≥ this value. E.g. `0.5` flags any row/column that is already more than half flagged. |
+| `axis` | `0` to operate on time rows; `1` to operate on frequency columns. |
+
+Updates `self.mask` in place and returns the new mask. Raises `RuntimeError` if called before `fit()`, `ValueError` if `axis` is not 0 or 1.
+
+```python
+# Flag any frequency channel that is >50% flagged
+mask = fitter.flag_by_fraction(threshold=0.5, axis=1)
+
+# Flag any time sample that is >80% flagged
+mask = fitter.flag_by_fraction(threshold=0.8, axis=0)
+```
 
 ## Data Format
 
@@ -131,7 +178,7 @@ sdr/
 
 - **Too many flags?** Increase `sigma_threshold` (try 4.5 or 5.0) or increase `sigma_floor_factor`.
 - **Missing faint RFI?** Decrease `sigma_threshold` (try 3.5), but watch for runaway flagging via the convergence plot.
-- **>50% RFI?** Switch to `noise_estimator="lower_tail"`. MAD breaks down above ~50% contamination; the lower-tail fit stays valid as long as RFI only adds power.
+- **>50% RFI? (BETA)** Switch to `noise_estimator="lower_tail"`. MAD breaks down above ~50% contamination; the lower-tail fit stays valid as long as RFI only adds power.
 - **Polynomial ringing at band edges?** Decrease `phase2_degree_freq`.
 - **Slow convergence?** Usually not an issue (typically 7-12 iterations), but can lower `max_iterations` to cap runtime.
 
@@ -147,5 +194,5 @@ RFI_flagger/
 │   └── plotting.py      # Visualization functions
 ├── notebooks/
 │   └── demo_rfi_flagging.ipynb
-└── 2025-12-02_16-54-49_obs.hd5f
+└── data/
 ```

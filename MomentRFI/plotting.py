@@ -25,7 +25,7 @@ def plot_waterfall(waterfall, freqs=None, times=None, ax=None, title="Waterfall"
     if freqs is not None and times is not None:
         extent = [freqs[0], freqs[-1], times[-1], times[0]]
 
-    norm = LogNorm() if log else None
+    norm = kwargs.pop("norm", LogNorm() if log else None)
     im = ax.imshow(waterfall, aspect="auto", extent=extent, cmap=cmap, norm=norm,
                    interpolation="none", **kwargs)
     ax.set_title(title)
@@ -232,13 +232,23 @@ def plot_summary(waterfall, fitter, freqs=None, times=None):
     ax4 = fig.add_subplot(2, 3, 5)
     fig.delaxes(fig.add_subplot(2, 3, 6))
 
-    plot_waterfall(waterfall, freqs, times, ax=ax0, title="Original Waterfall")
-    plot_waterfall(fitter.surface, freqs, times, ax=ax1, title="Fitted Surface")
+    # Use percentile-based colour limits so bright RFI spikes don't
+    # anchor vmax and compress the rest of the data into darkness.
+    vmin = np.nanpercentile(waterfall, 1)
+    vmax = np.nanpercentile(waterfall, 99)
+    robust_norm = LogNorm(vmin=vmin, vmax=vmax)
 
-    # Flagged waterfall: flagged pixels blanked (NaN) to show missing data
+    plot_waterfall(waterfall, freqs, times, ax=ax0, title="Original Waterfall",
+                   norm=robust_norm)
+    plot_waterfall(fitter.surface, freqs, times, ax=ax1, title="Fitted Surface",
+                   norm=LogNorm(vmin=vmin, vmax=vmax))
+
+    # Flagged waterfall: flagged pixels blanked (NaN) to show missing data.
+    # Re-use the same colour limits so all three waterfall panels are comparable.
     flagged = waterfall.astype(float).copy()
     flagged[fitter.mask] = np.nan
-    plot_waterfall(flagged, freqs, times, ax=ax2, title="Flagged Waterfall")
+    plot_waterfall(flagged, freqs, times, ax=ax2, title="Flagged Waterfall",
+                   norm=LogNorm(vmin=vmin, vmax=vmax))
 
     plot_residuals(fitter.residuals, freqs, times, ax=ax3)
     plot_mask(fitter.mask, freqs, times, ax=ax4)
