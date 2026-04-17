@@ -24,5 +24,6 @@ CLAUDE.md
 .vscode/
 .idea/
 
+.claude
 # OS
 .DS_Store
