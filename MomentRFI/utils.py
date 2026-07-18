@@ -1,5 +1,11 @@
 import numpy as np
-from scipy.ndimage import uniform_filter
+from scipy.ndimage import uniform_filter, convolve
+
+# Smallest convolved good-weight treated as a usable footprint in
+# masked_normalized_convolve. A footprint whose weight falls at or below this is
+# divided by the floor (not its true weight), so callers should also treat
+# ``weight > _WEIGHT_FLOOR`` as the validity test.
+_WEIGHT_FLOOR = 1e-12
 
 
 def mad_sigma(residuals):
@@ -46,7 +52,9 @@ def lower_tail_sigma(residuals, tail_fraction=0.2, max_samples=20_000):
         Fitted Gaussian sigma.
     """
     n = len(residuals)
-    k = int(n * tail_fraction)
+    # Clamp into a valid partition index: tail_fraction near 0 or 1 (or n small)
+    # would otherwise put k out of [0, n-1] and raise in np.partition.
+    k = min(max(int(n * tail_fraction), 1), n - 1)
 
     # O(n) partial sort to find the threshold
     threshold = np.partition(residuals, k)[k]
@@ -67,10 +75,15 @@ def lower_tail_sigma(residuals, tail_fraction=0.2, max_samples=20_000):
     # Linear regression:  y = a + b*z,  where b = -1/(2*sigma^2)
     z_mean = z.mean()
     y_mean = y.mean()
-    b = np.dot(z - z_mean, y - y_mean) / np.dot(z - z_mean, z - z_mean)
+    denom = np.dot(z - z_mean, z - z_mean)
 
-    # sigma = sqrt(-1 / (2b));  b must be negative for a valid Gaussian
-    if b >= 0:
+    # sigma = sqrt(-1 / (2b));  b must be negative for a valid Gaussian.
+    # Degenerate tails (a single occupied bin -> denom == 0) give b = nan, which
+    # `b >= 0` would NOT catch — guard denom explicitly and fall back to RMS.
+    if denom == 0 or not np.isfinite(denom):
+        return float(np.sqrt(np.mean(lower ** 2)))
+    b = np.dot(z - z_mean, y - y_mean) / denom
+    if not (b < 0):  # covers b >= 0 and b == nan
         # Fallback: use RMS of the lower-tail data as rough sigma
         return float(np.sqrt(np.mean(lower ** 2)))
 
@@ -172,3 +185,81 @@ def smooth_mask(mask, kernel_size=3):
 
     # Round to nearest integer: >= 0.5 -> 1, < 0.5 -> 0
     return np.round(smoothed).astype(bool)
+
+
+def masked_normalized_convolve(field, good, kernel, mode="reflect"):
+    """Mask-aware local weighted average of ``field`` under ``kernel``.
+
+    Computes ``(field * good) ⊛ kernel  /  good ⊛ kernel`` — i.e. a normalized
+    convolution that ignores pixels where ``good`` is False (already-flagged or
+    invalid data). This prevents bright RFI from leaking its power into the
+    smoothed field, which a plain convolution would do.
+
+    The normalization by the convolved good-indicator also makes the result a
+    true local mean regardless of how many pixels in each footprint are masked,
+    so partially-masked footprints near the array edges or near flagged regions
+    stay unbiased. Memory stays O(N) — ``scipy.ndimage.convolve`` streams.
+
+    Parameters
+    ----------
+    field : ndarray, shape (n_time, n_freq)
+        The 2D field to smooth (e.g. surface-fit residuals).
+    good : ndarray of bool, shape (n_time, n_freq)
+        True where the pixel is usable. False pixels contribute nothing.
+    kernel : array_like, 2D
+        Convolution kernel. Normalization is handled here, so the kernel scale
+        does not matter (a box, a diagonal ``np.eye(k)``, or a 1D ``(1, k)`` /
+        ``(k, 1)`` line all work).
+    mode : str
+        Boundary mode forwarded to ``scipy.ndimage.convolve``. Use ``'reflect'``
+        (default) so the local mean stays unbiased at the array borders. Do NOT
+        use ``'constant'`` with ``cval=0`` here — that biases the mean toward
+        zero at the edges (that mode is only appropriate for mask *dilation*).
+
+    Returns
+    -------
+    convolved : ndarray, shape (n_time, n_freq)
+        The normalized local average. Footprints with no good pixels are 0.
+    weight : ndarray, shape (n_time, n_freq)
+        The convolved good-indicator (``good ⊛ kernel``). ``weight <= 0`` marks
+        footprints that contain no usable pixels; the caller should exclude
+        those from any threshold test.
+
+    Notes
+    -----
+    Pure function: neither ``field`` nor ``good`` is mutated.
+    """
+    kf = np.asarray(kernel, dtype=float)
+    field = np.asarray(field, dtype=float)
+    good_f = np.asarray(good, dtype=float)
+    num = convolve(np.where(good, field, 0.0), kf, mode=mode)
+    weight = convolve(good_f, kf, mode=mode)
+    convolved = num / np.maximum(weight, _WEIGHT_FLOOR)
+    return convolved, weight
+
+
+def dilate_to_footprint(mask, kernel):
+    """Dilate a boolean mask to the geometric support of ``kernel``.
+
+    Any pixel within the kernel's non-zero footprint of a flagged pixel becomes
+    flagged. This maps a detection in a convolved image back to the native
+    resolution the broad RFI physically occupies: a box kernel dilates to a box,
+    a diagonal ``np.eye(k)`` dilates along the diagonal, a 1D line dilates along
+    its axis.
+
+    Parameters
+    ----------
+    mask : ndarray of bool, shape (n_time, n_freq)
+        Detection mask (True = flagged).
+    kernel : array_like, 2D
+        The same kernel used for the convolution; only its non-zero pattern
+        (support) is used, so kernel weights are irrelevant.
+
+    Returns
+    -------
+    ndarray of bool, shape (n_time, n_freq)
+        Dilated mask. Pure function: ``mask`` is not mutated.
+    """
+    support = (np.asarray(kernel) != 0).astype(float)
+    dilated = convolve(mask.astype(float), support, mode="constant", cval=0.0)
+    return dilated > 0

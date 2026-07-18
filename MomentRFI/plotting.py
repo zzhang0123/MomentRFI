@@ -95,64 +95,70 @@ def plot_residuals(residuals, freqs=None, times=None, ax=None, title="Residuals 
 
 
 def plot_convergence(history, ax=None):
-    """Plot convergence diagnostics for both phases.
+    """Plot round-based convergence diagnostics.
+
+    Shows the round-0 surface-fit iterations (sigma, flag fraction, and changed
+    fraction per iteration) and overlays each broad-RFI kernel round's estimated
+    sigma on the sigma panel.
 
     Parameters
     ----------
     history : dict
-        The .history attribute from IterativeSurfaceFitter.
+        The ``.history`` attribute from IterativeSurfaceFitter, of the form
+        ``{"round0": {"sigma": .., "iterations": [...]}, "broad_rounds": [...]}``.
     """
     if ax is None:
         fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     else:
         axes = ax
 
+    round0 = history.get("round0") or {}
+    iters = round0.get("iterations", [])
+    broad = history.get("broad_rounds", [])
+    x = [h["iteration"] for h in iters]
+
     # Sigma evolution
     ax0 = axes[0]
-    if history["phase1"]:
-        iters1 = [h["iteration"] for h in history["phase1"]]
-        sigmas1 = [h["sigma"] for h in history["phase1"]]
-        ax0.plot(iters1, sigmas1, "o-", label="Phase 1")
-    if history["phase2"]:
-        iters2 = [h["iteration"] for h in history["phase2"]]
-        sigmas2 = [h["sigma_used"] for h in history["phase2"]]
-        ax0.plot(iters2, sigmas2, "s-", label="Phase 2")
-        if history["phase2"][0].get("sigma_floor"):
-            ax0.axhline(history["phase2"][0]["sigma_floor"], ls="--", color="gray",
-                        label="Sigma floor")
+    if iters:
+        ax0.plot(x, [h["sigma_used"] for h in iters], "o-", label="Round 0")
+    for i, br in enumerate(broad):
+        label = f"broad {i} ({br['kernel']['kind']})"
+        ax0.axhline(br["sigma_c"], ls="--", alpha=0.7, label=label)
     ax0.set_xlabel("Iteration")
     ax0.set_ylabel("Sigma (MAD)")
     ax0.set_title("Sigma Evolution")
-    ax0.legend()
+    _legend_if_labeled(ax0)
 
     # Flag fraction
     ax1 = axes[1]
-    if history["phase1"]:
-        fracs1 = [h["flag_fraction"] * 100 for h in history["phase1"]]
-        ax1.plot(iters1, fracs1, "o-", label="Phase 1")
-    if history["phase2"]:
-        fracs2 = [h["flag_fraction"] * 100 for h in history["phase2"]]
-        ax1.plot(iters2, fracs2, "s-", label="Phase 2")
-    ax1.set_xlabel("Iteration")
+    if iters:
+        ax1.plot(x, [h["flag_fraction"] * 100 for h in iters], "o-", label="Round 0")
+    if broad:
+        bx = list(range(1, len(broad) + 1))
+        ax1.plot(bx, [br["flag_fraction"] * 100 for br in broad], "s--",
+                 color="C3", label="After broad rounds")
+    ax1.set_xlabel("Iteration (round 0) / broad round")
     ax1.set_ylabel("Flagged (%)")
     ax1.set_title("Flag Fraction")
-    ax1.legend()
+    _legend_if_labeled(ax1)
 
-    # Changed fraction (convergence)
+    # Changed fraction (round-0 convergence)
     ax2 = axes[2]
-    if history["phase1"]:
-        changed1 = [h["changed_fraction"] * 100 for h in history["phase1"]]
-        ax2.semilogy(iters1, changed1, "o-", label="Phase 1")
-    if history["phase2"]:
-        changed2 = [h["changed_fraction"] * 100 for h in history["phase2"]]
-        ax2.semilogy(iters2, changed2, "s-", label="Phase 2")
+    if iters:
+        ax2.semilogy(x, [h["changed_fraction"] * 100 for h in iters], "o-", label="Round 0")
     ax2.set_xlabel("Iteration")
     ax2.set_ylabel("Changed pixels (%)")
-    ax2.set_title("Convergence")
-    ax2.legend()
+    ax2.set_title("Round-0 Convergence")
+    _legend_if_labeled(ax2)
 
     plt.tight_layout()
     return axes
+
+
+def _legend_if_labeled(ax):
+    """Add a legend only if the axis has labelled artists (avoids warnings)."""
+    if ax.get_legend_handles_labels()[1]:
+        ax.legend(fontsize=8)
 
 
 def plot_time_averaged_spectrum(waterfall, freqs=None, mask=None, ax=None,
@@ -215,6 +221,9 @@ def plot_time_averaged_spectrum(waterfall, freqs=None, mask=None, ax=None,
 
 def plot_summary(waterfall, fitter, freqs=None, times=None):
     """Five-panel summary: original, surface, flagged, residuals, mask.
+
+    The surface and residual panels show the round-0 fit; the residual panel is
+    exactly the field the broad-RFI kernel rounds convolve.
 
     Parameters
     ----------

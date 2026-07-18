@@ -1,6 +1,6 @@
 # MomentRFI
 
-Iterative two-phase sigma-clipping for flagging Radio Frequency Interference (RFI) in radio cosmology waterfall data, using 2D polynomial surface fitting powered by [MomentEmu](https://github.com/zzhang0123/MomentEmu).
+Round-based iterative sigma-clipping for flagging Radio Frequency Interference (RFI) in radio cosmology waterfall data, using 2D polynomial surface fitting powered by [MomentEmu](https://github.com/zzhang0123/MomentEmu). One surface-fitting round catches bright RFI; optional per-kernel matched-filter rounds catch faint broad RFI.
 
 ## Installation
 
@@ -31,34 +31,36 @@ Radio waterfall data (time × frequency) contains a smooth astrophysical signal 
 
 > **Terminology:** throughout this documentation, *pixel* is used as a convenient shorthand for a single data point in the 2D waterfall array — i.e. one (time, frequency) sample. The data are not images, but the term is standard in RFI flagging literature.
 
-The key challenge is **coupling between polynomial degree and sigma threshold**: a low-degree polynomial leaves large residuals that inflate sigma, hiding real RFI. A high-degree polynomial can overfit RFI features, suppressing sigma and causing runaway flagging. A two-phase approach decouples these.
+RFI comes in two regimes that need different detectors. **Bright** RFI (narrow spikes, streaks) stands out per-pixel and is caught by thresholding the surface-fit residuals directly. **Faint broad** RFI (spatially or spectrally continuous, low amplitude) is buried in per-pixel noise but stands out when neighbouring pixels are summed — because continuous RFI adds ~linearly under a kernel while thermal noise adds in quadrature.
 
-### Two-Phase Strategy
+### Round-Based Strategy
 
-All fitting is performed in **log10 space** with coordinates normalized to **[-1, 1]**.
+All fitting is performed in **log10 space** with coordinates normalized to **[-1, 1]**. The algorithm runs **one surface-fitting round plus one detection round per convolution kernel**. Masks accumulate (union) across rounds.
 
-#### Phase 1: Sigma Calibration
+#### Round 0: Surface Fit (bright RFI)
 
-1. Fit an **isotropic** polynomial of conservative degree (default 5, giving 21 basis terms) to the full waterfall.
-2. Compute residuals (log10 data - log10 surface) at all pixels.
-3. Estimate noise from unflagged pixels using the chosen estimator (MAD-sigma by default; see [Noise Estimators](#noise-estimators) below).
-4. Flag pixels where |residual| > sigma_threshold * sigma.
+1. Fit an **anisotropic** polynomial (default degrees: frequency 10, time 5 → 66 basis terms) to `log10(waterfall)`.
+2. Compute residuals (log10 data − log10 surface) at all pixels.
+3. Estimate noise from unflagged pixels using the chosen estimator (MAD by default; see [Noise Estimators](#noise-estimators)).
+4. Flag pixels where |residual| > `sigma_threshold * sigma`.
 5. Repeat from step 1 using only unflagged pixels for the fit.
-6. Stop when <0.001% of pixels change between iterations (convergence), >50% are flagged (safety abort), or 15 iterations are reached.
-7. Record the final sigma as the **sigma floor**.
+6. Stop on convergence (< `convergence_fraction` of pixels change), safety abort (< `min_good_fraction` unflagged), or `max_iterations`.
 
-The low-degree polynomial intentionally underfits fine spectral structure, producing a reliable upper bound on the true noise level.
+Round 0 produces the baseline `surface`, the `residuals`, and the estimated `noise_sigma`. It replaces the old two-phase design: the separate low-degree "sigma calibration" phase is gone — the sigma floor it produced is no longer needed because there is only one fit and the broad rounds re-estimate their own noise.
 
-#### Phase 2: Refined Fitting (optional)
+#### Rounds 1..N: Broad-RFI Detection (per kernel, matched filter)
 
-Phase 2 is skipped when `phase2_degree_freq=None` or `phase2_degree_time=None`; in that case the Phase 1 mask, surface, and residuals are returned directly.
+Pass a tuple of kernels to `fit(waterfall, kernels=(...))`. For each kernel, in order:
 
-1. **Reset the mask** (start from any a priori flags supplied via `prior_mask`; discard Phase 1 sigma-clip flags).
-2. Fit an **anisotropic** polynomial with higher frequency-axis degree (default 10) and the same time-axis degree (default 5), giving 66 basis terms. This better captures spectral structure without overfitting time-domain variations.
-3. Compute residuals and sigma as before, but enforce: `sigma_used = max(sigma_raw, sigma_floor)`. This prevents the improved polynomial from driving sigma too low and causing runaway flagging.
-4. Flag and iterate with the same stopping criteria as Phase 1.
+1. **Convolve the round-0 residuals** with the kernel, mask-aware (already-flagged pixels are excluded via a normalized convolution `(residuals·good ⊛ K)/(good ⊛ K)`, `mode='reflect'`), so bright RFI cannot leak into its neighbours.
+2. Estimate `sigma_c` on the convolved residuals. Because the box averages K pixels, `sigma_c ≈ noise_sigma / √K` — the √K SNR boost is captured automatically, with **no hand-coded factor**.
+3. Flag where `convolved_residual > threshold * sigma_c` (one-sided positive — broad RFI only *adds* power). The threshold is `broad_sigma_threshold` if set, else `sigma_threshold`.
+4. If `dilate_detections` (default True), dilate each detection to the kernel's footprint so the broad RFI's full extent (including wings) is flagged.
+5. Union the detections into the accumulated mask.
 
-The result is a mask with fewer false positives than Phase 1 alone, because the higher-degree polynomial removes spectral structure that Phase 1 would misidentify as RFI.
+No surface is refit — the single round-0 baseline is reused, so a flexible polynomial can never "absorb" the broad RFI it is meant to find. This is the exact matched filter for a footprint-shaped RFI template in additive noise.
+
+Kernels can be any 2D array: a box `np.ones((3, 3))`, a diagonal `np.eye(3)` (drifting emitters), or a 1D line `np.ones((1, k))` / `np.ones((k, 1))` (broad in frequency / time). Passing no kernels runs round 0 only.
 
 ### Noise Estimators
 
@@ -75,7 +77,7 @@ Two options are available via the `noise_estimator` parameter:
 | **On clean data** | Tighter sigma, more sensitive | Wider sigma (includes spectral structure), more conservative |
 | **Best for** | Moderate RFI (<50%) | Heavy RFI (>50%) where MAD breaks down |
 
-(Note: I found MAD generally works better, at least for Phase 1.)
+(Note: I found MAD generally works better, at least for round 0.)
 
 ### Polynomial Basis
 
@@ -83,7 +85,9 @@ For a 2D polynomial (frequency, time):
 - **Isotropic degree d**: all monomials `freq^a * time^b` where `a + b <= d`. Number of terms = `(d+1)(d+2)/2`.
 - **Anisotropic degrees (d_freq, d_time)**: all monomials where `a <= d_freq` and `b <= d_time`. Number of terms = `(d_freq+1) * (d_time+1)`.
 
-Fitting uses the **moment method**: accumulate `M = Phi^T Phi / N` and `nu = Phi^T y / N` in batches (only building the small D x D matrix, never the full N x D design matrix), then solve `M c = nu`. This keeps memory usage constant regardless of waterfall size.
+Fitting uses the **moment method**: accumulate `M = Phi^T Phi / N` and `nu = Phi^T y / N` in batches, then solve `M c = nu`.
+
+**Basis caching (performance).** The coordinate grid is fixed for a whole fit, so rebuilding the monomial basis every sigma-clip iteration is pure redundancy — it dominates the runtime. With `precompute_basis=True` (default) the Vandermonde `Phi` is built **once** and reused across all iterations, giving a **~5× speedup** (e.g. a 1135×8192 fit drops from ~95 s to ~19 s) with **bit-identical** results. This trades the moment method's constant memory for `N·D·8` bytes of `Phi`; the `max_basis_gb` cap auto-falls-back to the constant-memory MomentEmu path when `Phi` would be too large. The full-grid surface is still evaluated every iteration, so wrongly-flagged good pixels can be re-admitted as the fit improves.
 
 ## Parameters
 
@@ -91,44 +95,47 @@ Fitting uses the **moment method**: accumulate `M = Phi^T Phi / N` and `nu = Phi
 
 | Parameter | Default | Description |
 |---|---|---|
-| `sigma_threshold` | 4.0 | Clipping threshold in units of sigma. Pixels with \|residual\| > threshold * sigma are flagged. Lower values flag more aggressively. |
-| `phase1_degree` | 5 | Isotropic polynomial degree for Phase 1 (sigma calibration). Higher values fit more spectral detail but risk absorbing RFI into the model. |
-| `phase2_degree_freq` | 10 | Frequency-axis degree for Phase 2. Frequency structure typically needs higher polynomial order than time. Set to `None` (with `phase2_degree_time=None`) to skip Phase 2 and return the Phase 1 mask directly. |
-| `phase2_degree_time` | 5 | Time-axis degree for Phase 2. Time variations are usually smoother. Set to `None` (with `phase2_degree_freq=None`) to skip Phase 2. |
-| `sigma_floor_factor` | 1.0 | Multiplier on the Phase 1 sigma to set the floor. Values > 1.0 make Phase 2 more conservative (fewer flags). |
-| `convergence_fraction` | 1e-5 | Iteration stops when the fraction of pixels that changed state is below this value. |
-| `min_good_fraction` | 0.5 | Safety abort: if the fraction of unflagged pixels drops below this, iteration stops immediately. |
-| `max_iterations` | 15 | Hard cap on iterations per phase. |
+| `sigma_threshold` | 4.0 | Clipping threshold in units of sigma (round 0, and broad rounds unless overridden). Pixels with \|residual\| > threshold * sigma are flagged. Lower values flag more aggressively. |
+| `degree_freq` | 10 | Frequency-axis degree of the round-0 anisotropic surface. Frequency structure typically needs higher polynomial order than time. |
+| `degree_time` | 5 | Time-axis degree of the round-0 surface. Time variations are usually smoother. |
+| `broad_sigma_threshold` | `None` | Threshold (in sigma) for the broad-RFI kernel rounds. `None` reuses `sigma_threshold`. |
+| `dilate_detections` | True | Dilate each broad-round detection to the kernel footprint, flagging the full spatial extent of the broad RFI rather than only the footprint centre. |
+| `convergence_fraction` | 1e-5 | Round-0 iteration stops when the fraction of pixels that changed state is below this value. |
+| `min_good_fraction` | 0.5 | Safety abort: if the fraction of unflagged pixels drops below this, round-0 iteration stops immediately. |
+| `max_iterations` | 15 | Hard cap on round-0 iterations. |
 | `batch_size` | 200,000 | Number of pixels processed per batch during polynomial evaluation. Controls memory vs speed tradeoff. |
 | `noise_estimator` | `"mad"` | `"mad"` or `"lower_tail"`. See [Noise Estimators](#noise-estimators). |
 | `lower_tail_fraction` | 0.2 | Fraction of lowest residuals used by the `"lower_tail"` estimator. Smaller = more conservative but noisier. |
-| `sigma_value` | `None` | Fixed sigma for clipping. If set, bypasses both the noise estimator and the Phase 2 sigma floor. Default `None` estimates sigma from data each iteration. |
-| `force_flag_fallback` | False | Force-flag top outliers when sigma is overestimated and flagging stalls (see below). |
-| `one_sided_clipping` | False | If True, convergence iterations only flag pixels above the surface (`residual > +k·sigma`). A final symmetric pass is applied after convergence to also flag extreme low-noise outliers. Default False (symmetric clipping throughout). |
-| `verbose` | True | Print per-iteration diagnostics. |
+| `sigma_value` | `None` | Fixed sigma for round-0 clipping. If set, bypasses the noise estimator in round 0. Broad rounds always re-estimate their own sigma on the convolved field. Default `None` estimates sigma from data. |
+| `force_flag_fallback` | False | Round-0 only: force-flag top outliers when sigma is overestimated and flagging stalls. Deliberately not applied to broad rounds (convolution correlates neighbours, so the Gaussian count would force-flag noise blobs). |
+| `one_sided_clipping` | False | Round-0 only: if True, convergence iterations only flag pixels above the surface (`residual > +k·sigma`), with a final symmetric pass. Broad rounds are always one-sided positive. Default False. |
+| `precompute_basis` | True | Build the polynomial basis (Vandermonde) once and reuse it across round-0 iterations instead of rebuilding it each iteration — ~5× faster with **bit-identical** results. Costs `N·D·8` bytes (`D = (degree_freq+1)(degree_time+1)`). Set False for MomentEmu's constant-memory path. |
+| `max_basis_gb` | 16.0 | Memory cap (GB) for the precomputed basis. If the full Vandermonde would exceed this, `fit()` automatically falls back to the constant-memory path, so huge waterfalls never OOM by default. |
+| `verbose` | True | Print per-round diagnostics. |
 
 ### `fit()` Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `waterfall` | — | 2D ndarray `(n_time, n_freq)`, positive linear-scale power values. |
-| `prior_mask` | `None` | Optional bool ndarray `(n_time, n_freq)`. `True` = known-bad pixel. Prior-flagged pixels are excluded from surface fitting in both phases and are always `True` in the returned mask, regardless of their residual. |
+| `waterfall` | — | 2D ndarray `(n_time, n_freq)`, positive linear-scale power values. Non-finite or non-positive pixels are automatically pre-flagged. |
+| `kernels` | `None` | Sequence of 2D ndarrays. `None`/empty runs round 0 only. One broad-RFI round runs per kernel, in order. Each kernel is 2D: box `np.ones((3,3))`, diagonal `np.eye(3)`, or 1D line `np.ones((1,k))` / `np.ones((k,1))`. |
+| `prior_mask` | `None` | Optional bool ndarray `(n_time, n_freq)`. `True` = known-bad pixel. Prior-flagged pixels are excluded from all statistics and are always `True` in the returned mask. |
 
 ### Outputs (after calling `.fit()`)
 
 | Attribute | Type | Description |
 |---|---|---|
-| `mask` | `ndarray[bool]` (n_time, n_freq) | `True` where RFI is flagged. |
-| `surface` | `ndarray[float]` (n_time, n_freq) | Fitted polynomial surface in **linear** scale (10^fitted_log10). |
-| `residuals` | `ndarray[float]` (n_time, n_freq) | Residuals in **log10** scale (log10_data - log10_surface). |
-| `sigma_floor` | `float` | MAD-sigma from Phase 1 convergence. |
-| `history` | `dict` | Per-iteration diagnostics for both phases (sigma, flag count, convergence). |
+| `mask` | `ndarray[bool]` (n_time, n_freq) | `True` where RFI is flagged (accumulated across all rounds). |
+| `surface` | `ndarray[float]` (n_time, n_freq) | Round-0 fitted polynomial surface in **linear** scale (10^fitted_log10). |
+| `residuals` | `ndarray[float]` (n_time, n_freq) | Round-0 residuals in **log10** scale (the field the kernels convolve). |
+| `noise_sigma` | `float` | Final round-0 sigma (the estimated noise level). |
+| `history` | `dict` | `{"round0": {"sigma", "iterations": [...]}, "broad_rounds": [{"kernel", "sigma_c", "n_new", "flag_fraction"}, ...]}`. |
 
 ### Post-processing Methods
 
 After calling `.fit()`, two methods are available to refine the mask:
 
-#### `smooth_mask_with_kernel(kernel_size=3, axis=1)`
+#### `dilate_mask(kernel_size=3, axis=1)`
 
 Dilate `self.mask` with a 1D kernel along a single axis. Any pixel that lies within `(kernel_size - 1) // 2` steps of a flagged pixel along the chosen axis is also flagged. This is a 1D morphological dilation.
 
@@ -141,10 +148,10 @@ Updates `self.mask` in place and returns the new mask. Raises `RuntimeError` if 
 
 ```python
 # Dilate 3 channels wide along frequency
-mask = fitter.smooth_mask_with_kernel(kernel_size=3, axis=1)
+mask = fitter.dilate_mask(kernel_size=3, axis=1)
 
 # Dilate 5 time samples wide along time
-mask = fitter.smooth_mask_with_kernel(kernel_size=5, axis=0)
+mask = fitter.dilate_mask(kernel_size=5, axis=0)
 ```
 
 #### `flag_by_fraction(threshold, axis)`
@@ -171,30 +178,45 @@ mask = fitter.flag_by_fraction(threshold=0.8, axis=0)
 Expects HDF5 files with the structure:
 ```
 sdr/
-  sdr_waterfall   (n_time, n_freq)  float64   -- power values, must be all positive
+  sdr_waterfall   (n_time, n_freq)  float64   -- power values, ideally all positive
+                                              --   (fit() auto-pre-flags non-finite / <=0 pixels)
   sdr_freqs       (n_freq,)         float64   -- frequency axis in MHz
   sdr_times       (n_time,)         float64   -- time axis in seconds
 ```
 
 ## Tuning Guide
 
-- **Too many flags?** Increase `sigma_threshold` (try 4.5 or 5.0) or increase `sigma_floor_factor`.
-- **Missing faint RFI?** Decrease `sigma_threshold` (try 3.5), but watch for runaway flagging via the convergence plot.
+- **Too many flags?** Increase `sigma_threshold` (try 4.5 or 5.0).
+- **Missing faint narrow RFI?** Decrease `sigma_threshold` (try 3.5), but watch for runaway flagging via the convergence plot.
+- **Missing faint *broad* RFI?** Add kernels matched to the RFI shape: a frequency-broad emitter → `np.ones((1, k))`; a time-persistent one → `np.ones((k, 1))`; a compact blob → `np.ones((3, 3))`; a drifting emitter → `np.eye(k)`. Larger kernels detect fainter, broader RFI (bigger √K) but blur fine structure — keep the kernel smaller than real baseline features. Tune broad sensitivity separately with `broad_sigma_threshold`.
 - **>50% RFI? (BETA)** Switch to `noise_estimator="lower_tail"`. MAD breaks down above ~50% contamination; the lower-tail fit stays valid as long as RFI only adds power.
-- **Polynomial ringing at band edges?** Decrease `phase2_degree_freq`.
+- **Polynomial ringing at band edges?** Decrease `degree_freq`.
 - **Slow convergence?** Usually not an issue (typically 7-12 iterations), but can lower `max_iterations` to cap runtime.
+
+Example with broad-RFI rounds:
+
+```python
+import numpy as np
+fitter = IterativeSurfaceFitter(sigma_threshold=4.0)
+mask = fitter.fit(waterfall, kernels=(np.ones((1, 9)), np.ones((5, 1))))
+# round 0 catches bright RFI; the two line kernels catch broad
+# frequency- and time-continuous RFI respectively.
+```
 
 ## Project Structure
 
 ```
-RFI_flagger/
+MomentRFI/
 ├── MomentRFI/
 │   ├── __init__.py      # Package exports
 │   ├── core.py          # IterativeSurfaceFitter (imports polynomial fitting from MomentEmu)
 │   ├── io.py            # load_waterfall(), validate_waterfall()
-│   ├── utils.py         # mad_sigma(), lower_tail_sigma(), coordinate grid utilities
+│   ├── utils.py         # mad_sigma(), lower_tail_sigma(), coordinate grid,
+│   │                    #   masked_normalized_convolve(), dilate_to_footprint()
 │   └── plotting.py      # Visualization functions
 ├── notebooks/
-│   └── demo_rfi_flagging.ipynb
+│   ├── demo_rfi_flagging.ipynb         # walkthrough (source)
+│   └── executed_demo_1.ipynb, ...      # pre-executed variants + comparisons
+├── tests/               # pytest suite (utils + round-based core, boundary tests)
 └── data/
 ```
