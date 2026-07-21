@@ -16,6 +16,7 @@ from .surface import (
 from .utils import (
     mad_sigma,
     lower_tail_sigma,
+    diff_sigma,
     build_coordinate_grid,
     masked_normalized_convolve,
     dilate_to_footprint,
@@ -108,11 +109,20 @@ class IterativeSurfaceFitter:
     batch_size : int
         Batch size for monomial evaluation.
     noise_estimator : str
-        ``"mad"`` (default) uses Median Absolute Deviation (robust up to ~50%
-        contamination). ``"lower_tail"`` fits sigma from the lower tail of the
-        residuals, valid even when >50% of pixels are RFI.
+        ``"mad"`` (default) uses the Median Absolute Deviation of the residuals
+        (robust up to ~50% contamination). ``"lower_tail"`` fits sigma from the
+        lower tail of the residuals, valid even when >50% of pixels are RFI.
+        ``"diff"`` estimates the round-0 per-pixel sigma from the successive
+        differences of the log-waterfall along ``diff_axis`` — ``MAD(ΔL)/√2`` —
+        which is fit-independent and immune to slowly-varying broad RFI (it
+        cancels in the difference like the signal). The ``"diff"`` sigma is
+        computed once and held fixed across round-0 iterations; the broad rounds
+        always fall back to MAD on the convolved field.
     lower_tail_fraction : float
         Quantile used by the ``"lower_tail"`` estimator.
+    diff_axis : int
+        Axis the ``"diff"`` estimator differences along: 0 = time (default),
+        1 = frequency. Pick the axis along which the signal varies most slowly.
     sigma_value : float or None
         If provided, use this value directly as the round-0 sigma in every
         iteration, bypassing the noise estimator. Broad rounds always re-estimate
@@ -169,6 +179,7 @@ class IterativeSurfaceFitter:
         batch_size=200_000,
         noise_estimator="mad",
         lower_tail_fraction=0.2,
+        diff_axis=0,
         sigma_value=None,
         force_flag_fallback=False,
         one_sided_clipping=False,
@@ -183,8 +194,11 @@ class IterativeSurfaceFitter:
                 for k in removed_kwargs
             )
             raise TypeError(f"IterativeSurfaceFitter: {hints}")
-        if noise_estimator not in ("mad", "lower_tail"):
-            raise ValueError(f"noise_estimator must be 'mad' or 'lower_tail', got '{noise_estimator}'")
+        if noise_estimator not in ("mad", "lower_tail", "diff"):
+            raise ValueError(
+                f"noise_estimator must be 'mad', 'lower_tail', or 'diff', got '{noise_estimator}'")
+        if diff_axis not in (0, 1):
+            raise ValueError(f"diff_axis must be 0 (time) or 1 (frequency), got {diff_axis}")
         for name, val in (("degree_freq", degree_freq), ("degree_time", degree_time)):
             if not isinstance(val, (int, np.integer)) or val < 0:
                 raise ValueError(f"{name} must be a non-negative int, got {val!r}")
@@ -209,6 +223,7 @@ class IterativeSurfaceFitter:
         self.batch_size = batch_size
         self.noise_estimator = noise_estimator
         self.lower_tail_fraction = lower_tail_fraction
+        self.diff_axis = diff_axis
         self.sigma_value = sigma_value
         self.force_flag_fallback = force_flag_fallback
         self.one_sided_clipping = one_sided_clipping
@@ -334,8 +349,13 @@ class IterativeSurfaceFitter:
         Phi = _build_phi(coords, mi, max(a for a, _ in mi), max(b for _, b in mi))
         return True, Phi, values_flat.reshape(-1, 1)
 
-    def _fit_round(self, values_flat, coords, multi_indices, prior_mask_flat, n_pixels):
+    def _fit_round(self, values_flat, coords, multi_indices, prior_mask_flat, n_pixels,
+                   fixed_sigma=None):
         """Run one iterative sigma-clip surface fit.
+
+        If ``fixed_sigma`` is given, it is used as sigma in every iteration
+        (e.g. the fit-independent "diff" noise floor) instead of re-estimating
+        from the residuals; ``sigma_value`` still overrides it.
 
         Returns ``(mask_flat, surface_flat, residuals_flat, final_sigma, records)``.
         ``surface_flat``/``residuals_flat`` are ``None`` if the round aborts on the
@@ -365,8 +385,12 @@ class IterativeSurfaceFitter:
                 surface_flat = _evaluate_surface(coords, coeffs, multi_indices, self.batch_size)
             residuals_flat = values_flat - surface_flat
 
-            sigma = (self.sigma_value if self.sigma_value is not None
-                     else self._estimate_sigma(residuals_flat[good]))
+            if self.sigma_value is not None:
+                sigma = self.sigma_value
+            elif fixed_sigma is not None:
+                sigma = fixed_sigma
+            else:
+                sigma = self._estimate_sigma(residuals_flat[good])
 
             new_mask, forced = self._clip_mask(residuals_flat, sigma, good)
             new_mask = new_mask | prior_mask_flat
@@ -515,18 +539,31 @@ class IterativeSurfaceFitter:
 
         # Safe log10: bad pixels are masked out; avoid -inf / warnings.
         safe = np.where(bad, 1.0, waterfall)
-        log_flat = np.log10(safe).ravel()
+        log_2d = np.log10(safe)
+        log_flat = log_2d.ravel()
         coords = build_coordinate_grid(n_time, n_freq)
 
         kernels = self._validate_kernels(kernels, shape)
         multi_indices = generate_multi_indices_with_degree_vec([self.degree_freq, self.degree_time])
+
+        # The "diff" estimator reads a fit-independent noise floor once from the
+        # successive differences of the log-waterfall, held fixed across round-0
+        # iterations. `sigma_value` (if set) still takes precedence in _fit_round.
+        fixed_sigma = None
+        if self.noise_estimator == "diff" and self.sigma_value is None:
+            good_2d = (~prior_mask_flat).reshape(n_time, n_freq)
+            fixed_sigma = diff_sigma(log_2d, good_2d, axis=self.diff_axis)
+            if not np.isfinite(fixed_sigma):
+                if self.verbose:
+                    print("  [diff] no valid difference pairs — falling back to per-iteration MAD.")
+                fixed_sigma = None
 
         # ---- Round 0: surface fit ----
         if self.verbose:
             self._print_round0_header(len(multi_indices), n_bad)
 
         mask0_flat, surface_flat, residuals_flat, sigma0, records = self._fit_round(
-            log_flat, coords, multi_indices, prior_mask_flat, n_pixels
+            log_flat, coords, multi_indices, prior_mask_flat, n_pixels, fixed_sigma=fixed_sigma
         )
         accumulated = prior_mask_flat | mask0_flat
         self.noise_sigma = sigma0
@@ -559,8 +596,12 @@ class IterativeSurfaceFitter:
         if self.sigma_value is not None:
             print(f"  Sigma: fixed={self.sigma_value} (noise estimator bypassed)")
         else:
-            print(f"  Noise estimator: {self.noise_estimator}"
-                  + (f" (tail={self.lower_tail_fraction})" if self.noise_estimator == "lower_tail" else ""))
+            extra = ""
+            if self.noise_estimator == "lower_tail":
+                extra = f" (tail={self.lower_tail_fraction})"
+            elif self.noise_estimator == "diff":
+                extra = f" (axis={'time' if self.diff_axis == 0 else 'freq'}, fit-independent)"
+            print(f"  Noise estimator: {self.noise_estimator}" + extra)
         if self.one_sided_clipping:
             print("  Clipping: one-sided (positive residuals only during convergence)")
         if n_bad:

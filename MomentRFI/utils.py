@@ -27,6 +27,53 @@ def mad_sigma(residuals):
     return 1.4826 * np.median(np.abs(residuals - med))
 
 
+def diff_sigma(values_2d, good_2d, axis=0):
+    """Robust noise sigma from successive differences along ``axis``.
+
+    Under the assumptions that the underlying signal varies slowly along
+    ``axis`` and the per-pixel noise is independent, the first difference
+    ``D = diff(values, axis)`` cancels the signal, leaving noise with standard
+    deviation ``sqrt(2) * sigma``. So ``sigma = MAD(D) / sqrt(2)``, with MAD the
+    robust (1.4826-scaled) estimator over the *valid* pairs (both endpoints
+    good).
+
+    Motivation (radiometer equation): in ``log`` space the multiplicative
+    thermal noise becomes additive and homoscedastic, so the differenced field
+    is a clean sqrt(2)-scaled draw of that noise. This estimator is therefore
+    **fit-independent** — differencing removes any slowly-varying baseline, not
+    just a fitted polynomial — and **immune to slowly-varying broad RFI**, which
+    cancels in the difference exactly like the signal; only fast/narrow outliers
+    survive, and MAD rejects those.
+
+    Parameters
+    ----------
+    values_2d : ndarray, shape (n_time, n_freq)
+        The field to difference (typically ``log10`` of the waterfall).
+    good_2d : ndarray of bool, same shape
+        True where the pixel is usable. A difference is counted only when both
+        of its endpoints are good.
+    axis : int
+        Axis to difference along (0 = time, default; 1 = frequency). Choose the
+        axis along which the signal varies most slowly.
+
+    Returns
+    -------
+    float
+        Estimated per-pixel noise sigma, or ``nan`` if there are no valid
+        difference pairs (e.g. a single sample along ``axis``, or everything
+        masked). Pure function: inputs are not mutated.
+    """
+    d = np.diff(values_2d, axis=axis)
+    if axis == 0:
+        pair_good = good_2d[:-1, :] & good_2d[1:, :]
+    else:
+        pair_good = good_2d[:, :-1] & good_2d[:, 1:]
+    valid = d[pair_good]
+    if valid.size == 0:
+        return float("nan")
+    return mad_sigma(valid) / np.sqrt(2.0)
+
+
 def lower_tail_sigma(residuals, tail_fraction=0.2, max_samples=20_000):
     """Estimate sigma by fitting a zero-mean Gaussian to the lower tail.
 

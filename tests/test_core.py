@@ -288,6 +288,47 @@ def test_lower_tail_estimator_runs(make_waterfall):
     assert fitter.noise_sigma > 0
 
 
+def test_noise_estimator_diff_runs_and_catches_bright(make_waterfall):
+    wf = make_waterfall(seed=17)
+    wf[20, 40] *= 40.0
+    fitter = _fitter(sigma_threshold=4.0, noise_estimator="diff")
+    mask = fitter.fit(wf)
+    assert mask[20, 40]
+    assert fitter.noise_sigma > 0
+
+
+def test_diff_sigma_is_fit_independent(make_waterfall):
+    # noise_sigma from the "diff" estimator equals diff_sigma of the log-waterfall
+    # directly (it does not depend on the surface fit), and is held fixed across
+    # round-0 iterations.
+    from MomentRFI import diff_sigma
+    wf = make_waterfall(nt=150, nf=200, noise=0.02, seed=5)
+    wf[10, 10] *= 40.0
+    fitter = _fitter(sigma_threshold=4.0, noise_estimator="diff")
+    fitter.fit(wf)
+    bad = ~np.isfinite(wf) | (wf <= 0)
+    good = ~bad
+    expected = diff_sigma(np.log10(np.where(bad, 1.0, wf)), good, axis=0)
+    assert fitter.noise_sigma == expected
+    used = [it["sigma_used"] for it in fitter.history["round0"]["iterations"]]
+    assert all(s == expected for s in used)         # fixed across iterations
+
+
+def test_diff_axis_freq(make_waterfall):
+    wf = make_waterfall(seed=6)
+    wf[20, 40] *= 40.0
+    fitter = _fitter(sigma_threshold=4.0, noise_estimator="diff", diff_axis=1)
+    mask = fitter.fit(wf)
+    assert mask[20, 40] and fitter.noise_sigma > 0
+
+
+def test_sigma_value_overrides_diff(make_waterfall):
+    wf = make_waterfall(seed=7)
+    fitter = _fitter(noise_estimator="diff", sigma_value=0.05)
+    fitter.fit(wf)
+    assert fitter.noise_sigma == 0.05               # sigma_value wins
+
+
 def test_one_sided_clipping_catches_negative_dropout_via_final_pass(make_waterfall):
     # one_sided flags only positive residuals DURING convergence, so a deep
     # negative dropout is caught only by the final symmetric pass. If that pass

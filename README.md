@@ -64,20 +64,22 @@ Kernels can be any 2D array: a box `np.ones((3, 3))`, a diagonal `np.eye(3)` (dr
 
 ### Noise Estimators
 
-Two options are available via the `noise_estimator` parameter:
+Three options are available via the `noise_estimator` parameter:
 
-**`"mad"` (default)** — Median Absolute Deviation: `1.4826 * median(|x - median(x)|)`. Robust up to ~50% contamination. The median remains anchored to the clean population even when many pixels are RFI. This is the right choice for most datasets.
+**`"mad"` (default)** — Median Absolute Deviation of the residuals: `1.4826 * median(|x - median(x)|)`. Robust up to ~50% contamination. The median remains anchored to the clean population even when many pixels are RFI. This is the right choice for most datasets.
 
 **`"lower_tail"`** — Zero-mean Gaussian fit to the lower tail. RFI adds power, so it only inflates the *upper* tail of the residual distribution. The lower tail should be clean noise. We histogram the bottom `lower_tail_fraction` (default 20%) of residuals and fit `A * exp(-x² / 2σ²)` analytically via linear regression of `log(counts)` vs `x²` — no iterative optimisation, just a closed-form solution.
 
-| | MAD | Lower-tail |
-|---|---|---|
-| **Robust up to** | ~50% contamination | >50% (only lower tail needs to be clean) |
-| **Speed** | Fast (two passes over data) | Fast (O(n) partition + histogram + linear regression) |
-| **On clean data** | Tighter sigma, more sensitive | Wider sigma (includes spectral structure), more conservative |
-| **Best for** | Moderate RFI (<50%) | Heavy RFI (>50%) where MAD breaks down |
+**`"diff"`** — Successive-difference estimator on the **log-waterfall**. In log space the multiplicative thermal noise becomes additive and homoscedastic (radiometer equation). Assuming the signal varies slowly along `diff_axis` (default: time) and per-pixel noise is independent, the first difference `ΔL` cancels the signal and has standard deviation `√2·σ`, so `σ = MAD(ΔL)/√2`. Two properties make this attractive: it is **fit-independent** (differencing removes *any* slowly-varying baseline, not just the fitted polynomial) and **immune to slowly-varying broad RFI** (which cancels in the difference just like the signal — only fast/narrow outliers survive, and MAD rejects those). The `"diff"` sigma is computed once from the raw log-waterfall and held fixed across round-0 iterations (a stable noise floor); the broad-RFI rounds still estimate their own sigma on the convolved field.
 
-(Note: I found MAD generally works better, at least for round 0.)
+| | MAD | Lower-tail | Diff |
+|---|---|---|---|
+| **Estimates from** | residuals | residuals (lower tail) | log-waterfall differences |
+| **Fit-dependent?** | yes | yes | **no** |
+| **Robust up to** | ~50% | >50% | ~50% (narrow RFI); broad RFI cancels entirely |
+| **Best for** | moderate RFI | heavy RFI (>50%) | data with broad RFI or an imperfect surface fit |
+
+(Note: I found MAD generally works well for round 0; `"diff"` is a good choice when broad RFI or baseline curvature would otherwise inflate the MAD.)
 
 ### Polynomial Basis
 
@@ -104,8 +106,9 @@ Fitting uses the **moment method**: accumulate `M = Phi^T Phi / N` and `nu = Phi
 | `min_good_fraction` | 0.5 | Safety abort: if the fraction of unflagged pixels drops below this, round-0 iteration stops immediately. |
 | `max_iterations` | 15 | Hard cap on round-0 iterations. |
 | `batch_size` | 200,000 | Number of pixels processed per batch during polynomial evaluation. Controls memory vs speed tradeoff. |
-| `noise_estimator` | `"mad"` | `"mad"` or `"lower_tail"`. See [Noise Estimators](#noise-estimators). |
+| `noise_estimator` | `"mad"` | `"mad"`, `"lower_tail"`, or `"diff"`. See [Noise Estimators](#noise-estimators). |
 | `lower_tail_fraction` | 0.2 | Fraction of lowest residuals used by the `"lower_tail"` estimator. Smaller = more conservative but noisier. |
+| `diff_axis` | 0 | Axis the `"diff"` estimator differences along: `0` = time, `1` = frequency. Pick the axis the signal varies most slowly along. |
 | `sigma_value` | `None` | Fixed sigma for round-0 clipping. If set, bypasses the noise estimator in round 0. Broad rounds always re-estimate their own sigma on the convolved field. Default `None` estimates sigma from data. |
 | `force_flag_fallback` | False | Round-0 only: force-flag top outliers when sigma is overestimated and flagging stalls. Deliberately not applied to broad rounds (convolution correlates neighbours, so the Gaussian count would force-flag noise blobs). |
 | `one_sided_clipping` | False | Round-0 only: if True, convergence iterations only flag pixels above the surface (`residual > +k·sigma`), with a final symmetric pass. Broad rounds are always one-sided positive. Default False. |
@@ -190,6 +193,7 @@ sdr/
 - **Missing faint narrow RFI?** Decrease `sigma_threshold` (try 3.5), but watch for runaway flagging via the convergence plot.
 - **Missing faint *broad* RFI?** Add kernels matched to the RFI shape: a frequency-broad emitter → `np.ones((1, k))`; a time-persistent one → `np.ones((k, 1))`; a compact blob → `np.ones((3, 3))`; a drifting emitter → `np.eye(k)`. Larger kernels detect fainter, broader RFI (bigger √K) but blur fine structure — keep the kernel smaller than real baseline features. Tune broad sensitivity separately with `broad_sigma_threshold`.
 - **>50% RFI? (BETA)** Switch to `noise_estimator="lower_tail"`. MAD breaks down above ~50% contamination; the lower-tail fit stays valid as long as RFI only adds power.
+- **Broad RFI or curved baseline inflating sigma?** Switch to `noise_estimator="diff"` — it reads the noise from time-differences of the log-waterfall, so broad RFI and any slow baseline cancel out and don't inflate the estimate.
 - **Polynomial ringing at band edges?** Decrease `degree_freq`.
 - **Slow convergence?** Usually not an issue (typically 7-12 iterations), but can lower `max_iterations` to cap runtime.
 
@@ -211,8 +215,9 @@ MomentRFI/
 │   ├── __init__.py      # Package exports
 │   ├── core.py          # IterativeSurfaceFitter (imports polynomial fitting from MomentEmu)
 │   ├── io.py            # load_waterfall(), validate_waterfall()
-│   ├── utils.py         # mad_sigma(), lower_tail_sigma(), coordinate grid,
-│   │                    #   masked_normalized_convolve(), dilate_to_footprint()
+│   ├── utils.py         # mad_sigma(), lower_tail_sigma(), diff_sigma(),
+│   │                    #   coordinate grid, masked_normalized_convolve(),
+│   │                    #   dilate_to_footprint()
 │   └── plotting.py      # Visualization functions
 ├── notebooks/
 │   ├── demo_rfi_flagging.ipynb         # walkthrough (source)

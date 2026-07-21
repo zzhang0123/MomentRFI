@@ -4,8 +4,8 @@ import pytest
 
 from MomentRFI.utils import (
     masked_normalized_convolve, dilate_to_footprint,
-    mad_sigma, lower_tail_sigma, normalize_to_interval, build_coordinate_grid,
-    smooth_mask,
+    mad_sigma, lower_tail_sigma, diff_sigma, normalize_to_interval,
+    build_coordinate_grid, smooth_mask,
 )
 
 
@@ -158,3 +158,65 @@ def test_smooth_mask_majority_vote():
     m[2, 2] = True                       # isolated single pixel
     out = smooth_mask(m, kernel_size=3)  # majority vote at 0.5 -> erodes it
     assert not out[2, 2]
+
+
+# ---------------------------------------------------------------------------
+# diff_sigma (difference-based noise estimator)
+# ---------------------------------------------------------------------------
+
+def _slow_field(nt=200, nf=300, sigma=0.02, seed=0):
+    rng = np.random.default_rng(seed)
+    t = np.linspace(-1, 1, nt)[:, None]
+    f = np.linspace(-1, 1, nf)[None, :]
+    base = 1.0 + 0.3 * f + 0.2 * f ** 2 + 0.1 * t          # smooth in both axes
+    return base + rng.normal(0.0, sigma, (nt, nf)), sigma
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_diff_sigma_recovers_noise(axis):
+    L, sigma = _slow_field()
+    good = np.ones_like(L, dtype=bool)
+    est = diff_sigma(L, good, axis=axis)
+    assert abs(est - sigma) < 0.05 * sigma        # within 5%
+
+
+def test_diff_sigma_beats_mad_on_baseline():
+    # MAD on the raw field is dominated by the smooth baseline (~0.18 here); diff
+    # recovers the true noise (~0.02), i.e. several times smaller.
+    L, sigma = _slow_field()
+    good = np.ones_like(L, dtype=bool)
+    assert diff_sigma(L, good, axis=0) < 0.25 * mad_sigma(L.ravel())
+
+
+def test_diff_sigma_immune_to_broad_rfi():
+    # A slowly-varying broad patch cancels in the time-difference -> no bias.
+    L, sigma = _slow_field()
+    good = np.ones_like(L, dtype=bool)
+    base_est = diff_sigma(L, good, axis=0)
+    L2 = L.copy()
+    L2[60:70, 90:110] += 0.05                     # broad, ~constant in time
+    assert abs(diff_sigma(L2, good, axis=0) - base_est) < 0.02 * base_est
+
+
+def test_diff_sigma_robust_to_narrow_spikes():
+    L, sigma = _slow_field()
+    good = np.ones_like(L, dtype=bool)
+    L2 = L.copy()
+    L2[::13, ::17] += 1.0                          # sparse bright spikes
+    assert abs(diff_sigma(L2, good, axis=0) - sigma) < 0.1 * sigma
+
+
+def test_diff_sigma_masks_pairs_with_bad_endpoint():
+    # A difference pair is used only when BOTH endpoints are good.
+    L = np.zeros((4, 3))
+    L[1, 0] = 1e6                                  # a huge value
+    good = np.ones((4, 3), dtype=bool)
+    good[1, 0] = False                             # ...but it's flagged
+    est = diff_sigma(L, good, axis=0)
+    assert np.isfinite(est) and est == 0.0         # remaining diffs are all 0
+
+
+def test_diff_sigma_empty_returns_nan():
+    L = np.zeros((1, 5))                            # single time sample
+    good = np.ones((1, 5), dtype=bool)
+    assert np.isnan(diff_sigma(L, good, axis=0))

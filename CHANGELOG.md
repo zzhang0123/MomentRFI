@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased] — 2026-07-20
+
+### Difference-based noise estimator (`noise_estimator="diff"`)
+- New `"diff"` option estimates the round-0 per-pixel sigma from the successive
+  differences of the **log-waterfall** along `diff_axis` (default: time):
+  `σ = MAD(ΔL)/√2`. In log space the multiplicative thermal noise is additive and
+  homoscedastic (radiometer equation), so the differenced field is a clean
+  √2-scaled draw of the noise. Unlike MAD-on-residuals it is **fit-independent**
+  (differencing removes any slow baseline, not just the polynomial) and **immune
+  to slowly-varying broad RFI** (it cancels in the difference like the signal).
+  Computed once and held fixed across round-0 iterations; broad rounds still
+  estimate sigma on the convolved field. New `diff_axis` param (0=time, 1=freq).
+- New public helper `MomentRFI.diff_sigma(values_2d, good_2d, axis=0)` (also
+  exports `mad_sigma`).
+
+### Tooling
+- Registered a distinct `rfi_flagger` Jupyter kernel and pointed every notebook
+  at it (was the generic `python3`, which resolved to whatever env launched
+  Jupyter — an env lacking MomentEmu produced "No module named MomentEmu").
+
 ## [Unreleased] — 2026-07-17
 
 ### Redesign: two-phase → round-based flagging (breaking)
