@@ -18,9 +18,16 @@ tests now run and pass unmodified.
   behind it. `[dev]` adds pytest, matplotlib and jupyter for the notebooks.
 
 ```bash
-pip install -e .
+pip install "MomentEmu @ git+https://github.com/zzhang0123/MomentEmu"
 pip install "MomentRFI @ git+https://github.com/zzhang0123/MomentRFI"
 ```
+
+**MomentEmu has to go in first.** It is not on PyPI, so declaring it as a
+dependency names it without making it resolvable: `pip install MomentRFI`
+alone fails at that step. The declaration is still the right thing — it states
+the requirement, and an editable or VCS install of MomentEmu satisfies it —
+but the README now leads with the ordering rather than leaving it to be
+discovered.
 
 ### Difference-based noise estimator (`noise_estimator="diff"`)
 - New `"diff"` option estimates the round-0 per-pixel sigma from the successive

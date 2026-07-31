@@ -4,7 +4,27 @@ Round-based iterative sigma-clipping for flagging Radio Frequency Interference (
 
 ## Installation
 
-Dependencies: `numpy`, `scipy`, `matplotlib`, `h5py`, `jupyter`, `MomentEmu`.
+**Install [MomentEmu](https://github.com/zzhang0123/MomentEmu) first.** It is
+not on PyPI, so it cannot be resolved as an ordinary dependency — a plain
+`pip install MomentRFI` fails at that step, not at anything about this package.
+
+```bash
+pip install "MomentEmu @ git+https://github.com/zzhang0123/MomentEmu"
+pip install "MomentRFI @ git+https://github.com/zzhang0123/MomentRFI"
+```
+
+From a checkout, editable:
+
+```bash
+pip install -e ../MomentEmu
+pip install -e ".[dev]"        # dev adds pytest, matplotlib and jupyter
+```
+
+Runtime dependencies are `numpy`, `scipy`, `h5py` and `MomentEmu`. `matplotlib`
+is the `[plot]` extra rather than a runtime dependency: `MomentRFI/__init__.py`
+does not import `MomentRFI.plotting`, so a flagging-only install — the one a
+pipeline wants — does not pull a plotting stack behind it. `[dev]` includes it
+because the test suite covers `plotting`.
 
 ## Quick Start
 

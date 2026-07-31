@@ -14,6 +14,10 @@ dependencies = [
     "numpy",
     "scipy",
     "h5py",
+    # Not on PyPI, so naming it here states the requirement without making it
+    # resolvable: a plain `pip install MomentRFI` fails at this line rather
+    # than at anything about this package. Install MomentEmu first, from git
+    # or from a checkout, and this is satisfied. See the README.
     "MomentEmu",
 ]
 keywords = ["radio-astronomy", "rfi", "flagging", "waterfall", "intensity-mapping"]
