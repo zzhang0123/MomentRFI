@@ -2,6 +2,33 @@
 
 ## [Unreleased] — 2026-07-20
 
+### Packaging (`pyproject.toml`)
+
+The package had no `pyproject.toml` or `setup.py`, so it could only be used by
+putting its directory on `sys.path` — and nothing downstream could depend on it
+at all. `rheplicant`'s `MomentRFIFlaggingOperator` had a full test suite that
+was skipped in every environment, including CI, for exactly this reason; those
+tests now run and pass unmodified.
+
+- hatchling backend, flat layout (`packages = ["MomentRFI"]`), version 0.1.0.
+- Runtime dependencies: `numpy`, `scipy`, `h5py`, `MomentEmu`.
+- `matplotlib` is an extra (`[plot]`) rather than a runtime dependency, because
+  `__init__` deliberately does not import `plotting` — so a flagging-only
+  install, which is what a pipeline wants, does not drag a plotting stack
+  behind it. `[dev]` adds pytest, matplotlib and jupyter for the notebooks.
+
+```bash
+pip install "MomentEmu @ git+https://github.com/zzhang0123/MomentEmu"
+pip install "MomentRFI @ git+https://github.com/zzhang0123/MomentRFI"
+```
+
+**MomentEmu has to go in first.** It is not on PyPI, so declaring it as a
+dependency names it without making it resolvable: `pip install MomentRFI`
+alone fails at that step. The declaration is still the right thing — it states
+the requirement, and an editable or VCS install of MomentEmu satisfies it —
+but the README now leads with the ordering rather than leaving it to be
+discovered.
+
 ### Difference-based noise estimator (`noise_estimator="diff"`)
 - New `"diff"` option estimates the round-0 per-pixel sigma from the successive
   differences of the **log-waterfall** along `diff_axis` (default: time):
