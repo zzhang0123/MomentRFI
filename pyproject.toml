@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "MomentRFI"
+version = "0.1.0"
+description = "Round-based iterative sigma-clipping RFI flagging for radio cosmology waterfall data, using 2D polynomial surface fitting powered by MomentEmu"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Zheng Zhang", email = "zheng_zhang1@alumni.brown.edu" }]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "scipy",
+    "h5py",
+    "MomentEmu",
+]
+keywords = ["radio-astronomy", "rfi", "flagging", "waterfall", "intensity-mapping"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+# matplotlib is imported only by MomentRFI.plotting, which the package's
+# __init__ deliberately does not pull in — so a flagging-only install (the one
+# a pipeline wants) does not drag a plotting stack behind it.
+[project.optional-dependencies]
+plot = ["matplotlib"]
+dev = ["pytest", "pytest-cov", "matplotlib", "jupyter"]
+
+[project.urls]
+Homepage = "https://github.com/zzhang0123/MomentRFI"
+Repository = "https://github.com/zzhang0123/MomentRFI"
+"Bug Tracker" = "https://github.com/zzhang0123/MomentRFI/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["MomentRFI"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
